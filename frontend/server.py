@@ -284,6 +284,28 @@ def run_binary(engine, p, timeout=RUN_TIMEOUT):
     return res
 
 
+def _dataset_ok(want, meta):
+    """meta.json must describe this request *and* the files must match it.
+
+    Checking meta.json alone is not enough: gendata can legitimately decline to
+    write the ground truth (over --gt-budget) and the sizes are what the
+    benchmark actually indexes. A mismatch here is silently wrong recall later.
+    """
+    if not all(meta.get(key) == val for key, val in want.items()):
+        return False
+    sizes = {
+        "db.f32": want["n"] * want["d"] * 4,
+        "queries.f32": want["q"] * want["d"] * 4,
+    }
+    if meta.get("gt") is True:
+        sizes["gt_idx.i32"] = want["q"] * want["k"] * 4
+    for name, expected in sizes.items():
+        path = os.path.join(DATA_DIR, name)
+        if not os.path.isfile(path) or os.path.getsize(path) != expected:
+            return False
+    return True
+
+
 def ensure_dataset(n, d, q, k, seed, force=False):
     """Make data/ match the requested parameters; run bin/gendata if needed."""
     gd = gendata_bin()
@@ -294,8 +316,8 @@ def ensure_dataset(n, d, q, k, seed, force=False):
     if not force and os.path.isfile(meta_path):
         try:
             with open(meta_path) as f:
-                got = json.load(f)
-            if all(got.get(key) == val for key, val in want.items()):
+                meta = json.load(f)
+            if _dataset_ok(want, meta):
                 return DATA_DIR, False
         except Exception:
             pass
@@ -306,6 +328,8 @@ def ensure_dataset(n, d, q, k, seed, force=False):
     if proc.returncode != 0:
         raise ValueError("gendata failed: " + "\n".join(
             ((proc.stdout or "") + (proc.stderr or "")).strip().splitlines()[-6:]))
+    # gendata may have skipped the ground truth (it says so); the benchmark then
+    # computes an exact oracle with FAISS instead, so this is not an error.
     return DATA_DIR, True
 
 

@@ -70,7 +70,7 @@ $(BIN)/knn_omp: $(SRC)/knn_omp.cpp $(SRC)/common.hpp | $(BIN)
 	$(CXX) $(CXXFLAGS) $(OMPFLAGS) -o $@ $<
 
 $(BIN)/gendata: $(SRC)/gendata.cpp $(SRC)/common.hpp | $(BIN)
-	$(CXX) $(CXXFLAGS) -o $@ $<
+	$(CXX) $(CXXFLAGS) $(OMPFLAGS) -o $@ $<
 
 # ---- unified engine --------------------------------------------------------
 $(BIN)/knn.o: $(SRC)/knn.cu $(SRC)/fused_topk.cuh $(SRC)/common.hpp | $(BIN)
@@ -121,8 +121,10 @@ check-gpu: gpu
 
 # Objective 3: brute force vs the established approximate index (FAISS).
 # Runs on the GPU box; faiss-gpu is installed by remote/colab_bootstrap.py.
+# --gt-budget is raised so the headline config gets the double-precision CPU
+# oracle (one query per thread, so this is minutes, not hours).
 compare: $(BIN)/gendata
-	./$(BIN)/gendata --n 1000000 --d 128 --q 1000 --k 10 --seed 42 --out $(DATA_DIR)
+	./$(BIN)/gendata --n 1000000 --d 128 --q 1000 --k 10 --seed 42 --gt-budget 2e11 --out $(DATA_DIR)
 	$(PYTHON) bench/faiss_compare.py --data $(DATA_DIR) --k 10 --json $(DATA_DIR)/faiss.json
 
 clean:

@@ -41,9 +41,12 @@ python3 bench/faiss_compare.py --data data --k 10 \
 
 `bin/gendata` writes `db.f32`, `queries.f32` and the double-precision
 `gt_idx.i32`/`gt_dist.f32`, so FAISS and our kernel see byte-identical data and
-recall@k is measured against the same oracle. The harness sweeps `nprobe`
-(IVF-PQ) and `efSearch` (HNSW) and reports recall@k vs latency; the frontend
-draws the recall-vs-latency curve.
+recall@k is measured against the same oracle. The reference is computed one
+query per thread and is skipped above `--gt-budget` (default 2e11); when it is
+skipped, stale `gt_*` files are removed, `meta.json` records `"gt": false`, and
+the harness computes an exact `IndexFlatL2` oracle instead and says so. The
+harness sweeps `nprobe` (IVF-PQ) and `efSearch` (HNSW) and reports recall@k vs
+latency; the frontend draws the recall-vs-latency curve.
 
 ## Quick start on a free Colab GPU
 

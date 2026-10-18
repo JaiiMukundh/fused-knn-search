@@ -137,8 +137,10 @@
       The exact side is our fused kernel: every true neighbour, recall = 1. The approximate side
       is FAISS running on the <b>identical vectors</b>, exported by <code>bin/gendata</code> —
       IVF-PQ and HNSW, swept over <code>nprobe</code> / <code>efSearch</code>. recall@k is
-      measured against the exact ground truth. The question this answers is where the ANN curve
-      buys latency and exactly what recall it costs.
+      measured against the exact ground truth (the double-precision CPU reference, or an exact
+      FAISS <code>IndexFlat</code> oracle when that reference is over its budget — the card below
+      says which was used). The question this answers is where the ANN curve buys latency and
+      exactly what recall it costs.
     </div>
     <div class="grid">
       <div><label>database size (n)</label><input id="cn" value="1000000"></div>

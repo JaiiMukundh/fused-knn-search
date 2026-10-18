@@ -155,6 +155,10 @@ def main():
     ap.add_argument("--cpu", action="store_true", help="force CPU even if a GPU exists")
     ap.add_argument("--no-hnsw", action="store_true", help="skip HNSW (it is CPU-only)")
     ap.add_argument("--skip-flat", action="store_true", help="skip the exact FAISS baseline")
+    ap.add_argument("--force-gt", action="store_true",
+                    help="ignore gendata's gt_idx.i32 even when meta.json says gt=true")
+    ap.add_argument("--require-gendata-gt", action="store_true",
+                    help="fail instead of falling back to a FAISS IndexFlat oracle")
     ap.add_argument("--json", default="", help="write the result JSON here")
     args = ap.parse_args()
 
@@ -181,16 +185,42 @@ def main():
     }
 
     # ---- ground truth ------------------------------------------------------
+    # The oracle must be the exact answer for *these* q queries. gendata only
+    # writes it when the double-precision scan fits its --gt-budget, and records
+    # the outcome in meta.json. Never trust the file just because it exists: a
+    # leftover gt_idx.i32 from an earlier --q is the classic way to end up
+    # scoring recall against the wrong answers.
     gt_path = os.path.join(args.data, "gt_idx.i32")
-    if os.path.isfile(gt_path) and not args.skip_flat:
-        gt_labels = load_i32(gt_path, q, k)
-        gt_source = "gendata (double-precision CPU reference)"
-        print(f"[gt  ] loaded {gt_path}", flush=True)
-    else:
+    gt_labels = None
+    gt_source = None
+    if meta.get("gt") is True and not args.force_gt:
+        if os.path.isfile(gt_path):
+            got = os.path.getsize(gt_path) // 4
+            if got == q * k:
+                gt_labels = load_i32(gt_path, q, k)
+                gt_source = "gendata (double-precision CPU reference)"
+                print(f"[gt  ] loaded {gt_path}  ({q}x{k}, double-precision reference)",
+                      flush=True)
+            else:
+                print(f"[gt  ] !! ignoring {gt_path}: holds {got} ints but this run needs "
+                      f"{q * k} (stale file from a different --q/--k/target)", flush=True)
+        else:
+            print(f"[gt  ] meta.json claims gt=true but {gt_path} is missing", flush=True)
+    elif meta.get("gt") is not True:
+        print(f"[gt  ] meta.json says gt=false (gendata --gt-budget was too small for "
+              f"q*n*d={q * n * d:.3g})", flush=True)
+
+    if gt_labels is None:
+        if args.require_gendata_gt:
+            sys.exit("no usable double-precision ground truth in "
+                     f"{args.data}/.\n"
+                     "  Rebuild it with a bigger budget, e.g.:\n"
+                     f"    ./bin/gendata --n {n} --d {d} --q {q} --k {k} "
+                     f"--seed {meta['seed']} --gt-budget {q * n * d * 2:.3g} --out {args.data}")
         flat, finfo = build_flat(faiss, db, use_gpu, resources)
         _, gt_labels = topk_of(faiss, flat, queries, k)
-        gt_source = f"faiss IndexFlatL2 ({finfo['device']})"
-        print(f"[gt  ] computed exactly with {gt_source}", flush=True)
+        gt_source = f"faiss IndexFlatL2 ({finfo['device']}, exact brute force)"
+        print(f"[gt  ] computed with {gt_source}", flush=True)
     result["gt_source"] = gt_source
 
     # ---- the exact baseline ------------------------------------------------

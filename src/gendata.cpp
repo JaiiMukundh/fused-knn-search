@@ -17,22 +17,38 @@
 //
 // No CUDA, no MPI: builds and runs on any machine with g++.
 //
-// Ground truth (gt_*) is the double-precision CPU reference from common.hpp.
-// It is O(q*n*d) and therefore only computed when that fits --gt-budget;
-// on the GPU box you would instead compute the exact ground truth with
-// FAISS IndexFlatL2 / the fused kernel (see bench/faiss_compare.py).
+// Ground truth (gt_*) is the double-precision CPU reference from common.hpp,
+// computed one query per thread. It is O(q*n*d) and therefore only computed
+// when that fits --gt-budget; when it does not, the stale gt_* files are
+// removed and meta.json records "gt": false so the benchmark computes an exact
+// ground truth with FAISS IndexFlat instead (see bench/faiss_compare.py).
 
 #include <cerrno>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
 
 #include "common.hpp"
 
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+
 using namespace pcap;
 
 namespace {
+
+// gt_idx.i32 / gt_dist.f32 are optional outputs, and they must never be read
+// back at a shape they were not written at: a leftover gt file from an earlier
+// --q (say 200 rows when this run wants 1000) silently makes the ANN benchmark
+// compare against the wrong ground truth. Start every run by removing them;
+// they are rewritten below only when the reference is actually computed.
+void remove_stale_gt(const std::string& gi, const std::string& gd) {
+    if (std::remove(gi.c_str()) == 0) std::printf("[clean] removed stale %s\n", gi.c_str());
+    if (std::remove(gd.c_str()) == 0) std::printf("[clean] removed stale %s\n", gd.c_str());
+}
 
 bool write_all(FILE* f, const void* p, size_t bytes) {
     return bytes == 0 || std::fwrite(p, 1, bytes, f) == bytes;
@@ -97,7 +113,7 @@ int main(int argc, char** argv) {
     // Pull our own flags out first: common.hpp's parse_args() rejects anything
     // it does not know, so it must only ever see the shared flags.
     std::string out = "data";
-    double gt_budget = 2e10;   // max q*n*d operations for the in-process reference
+    double gt_budget = 2e11;   // max q*n*d ops for the in-process reference
     std::vector<char*> rest;
     rest.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
@@ -116,6 +132,9 @@ int main(int argc, char** argv) {
     }
     Args a = parse_args((int)rest.size(), rest.data());
     if (out.empty()) { std::fprintf(stderr, "--out must not be empty\n"); return 2; }
+#if defined(_OPENMP)
+    if (a.threads > 0) omp_set_num_threads(a.threads);
+#endif
 
     const std::string cmd = "mkdir -p '" + out + "'";
     if (std::system(cmd.c_str()) != 0) {
@@ -139,20 +158,36 @@ int main(int argc, char** argv) {
                 (double)a.q * a.d * sizeof(float) / 1e6);
 
     // Exact ground truth, when the double-precision scan is affordable.
+    // The stale-file cleanup happens in both branches: see remove_stale_gt().
     const double ops = (double)a.q * (double)a.n * (double)a.d;
-    if (ops <= gt_budget) {
+    const bool want_gt = ops <= gt_budget;
+    remove_stale_gt(gi_path, gd_path);
+
+    if (want_gt) {
         std::vector<int> idx(a.q * (size_t)a.k);
         std::vector<float> dist(a.q * (size_t)a.k);
         const double t0 = wall_time();
-        // The reference needs the query vector itself; regenerate it here so we
-        // never have to keep q*d in memory alongside the streamed database.
-        std::vector<float> query((size_t)a.d);
-        for (size_t qq = 0; qq < a.q; ++qq) {
-            for (int t = 0; t < a.d; ++t) query[t] = query_value(qq, t, a.seed);
+        // One query per thread: cpu_topk_from_fn() is stateless, so this is
+        // embarrassingly parallel, and q*n*d is the whole cost of the program.
+#if defined(_OPENMP)
+        const int nthreads = omp_get_max_threads();
+#else
+        const int nthreads = 1;
+#endif
+        std::printf("[gt  ] double-precision reference over %zu queries on %d thread%s ...\n",
+                    a.q, nthreads, nthreads == 1 ? "" : "s");
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(dynamic)
+#endif
+        for (long long qq = 0; qq < (long long)a.q; ++qq) {
+            // The query vector is regenerated per query so q*d never has to sit
+            // in memory next to the streamed database (and each thread owns it).
+            std::vector<float> query((size_t)a.d);
+            for (int t = 0; t < a.d; ++t) query[t] = query_value((size_t)qq, t, a.seed);
             const std::vector<Hit> ref = cpu_topk_from_fn(query.data(), a.n, a.d, a.k, a.seed);
             for (int j = 0; j < a.k && j < (int)ref.size(); ++j) {
-                idx[qq * a.k + j] = ref[j].idx;
-                dist[qq * a.k + j] = (float)ref[j].dist;
+                idx[(size_t)qq * a.k + j] = ref[j].idx;
+                dist[(size_t)qq * a.k + j] = (float)ref[j].dist;
             }
         }
         FILE* fi = std::fopen(gi_path.c_str(), "wb");
@@ -173,11 +208,12 @@ int main(int argc, char** argv) {
         std::printf("[gt  ] double-precision reference in %.1f s\n", wall_time() - t0);
     } else {
         std::printf("[gt  ] skipped: q*n*d = %.3g > --gt-budget %.3g\n", ops, gt_budget);
-        std::printf("[gt  ] compute ground truth on the GPU box instead "
-                    "(bench/faiss_compare.py --make-gt)\n");
+        std::printf("[gt  ] no gt_*.i32 written to %s/; bench/faiss_compare.py will compute\n", out.c_str());
+        std::printf("[gt  ] an exact ground truth with FAISS IndexFlat instead. Pass\n");
+        std::printf("[gt  ] --gt-budget %.3g to build the double-precision one here.\n", ops);
     }
 
-    if (!write_meta(out + "/meta.json", a, ops <= gt_budget)) return 1;
-    std::printf("[write] meta.json\n");
+    if (!write_meta(out + "/meta.json", a, want_gt)) return 1;
+    std::printf("[write] meta.json    gt=%s\n", want_gt ? "true" : "false");
     return 0;
 }
