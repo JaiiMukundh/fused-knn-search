@@ -93,9 +93,21 @@ def run(cmd, check=True, timeout=900, quiet=False, env=None, cwd=None):
     return p
 
 
+_LOG_OFFSET = {}
+
+
 def spawn(args, logpath, cwd="/", env=None):
-    """Start a process detached from the kernel (survives cell re-runs)."""
+    """Start a process detached from the kernel (survives cell re-runs).
+
+    Records the log's current size so wait_for_regex() only matches output
+    produced by THIS process -- a re-run of the cell in the same VM must not
+    return a stale bore port / tunnel URL from the previous run.
+    """
     os.makedirs(os.path.dirname(logpath), exist_ok=True)
+    try:
+        _LOG_OFFSET[logpath] = os.path.getsize(logpath)
+    except OSError:
+        _LOG_OFFSET[logpath] = 0
     logf = open(logpath, "ab")
     p = subprocess.Popen(args, stdout=logf, stderr=subprocess.STDOUT,
                          start_new_session=True, cwd=cwd, env=env)
@@ -152,10 +164,12 @@ def pick_free_port(preferred=0):
 def wait_for_regex(logpath, pattern, timeout, what):
     rx = re.compile(pattern)
     text = ""
+    offset = _LOG_OFFSET.get(logpath, 0)      # ignore pre-spawn (stale) lines
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             with open(logpath, "r", errors="replace") as f:
+                f.seek(offset)
                 text = f.read()
         except OSError:
             text = ""
