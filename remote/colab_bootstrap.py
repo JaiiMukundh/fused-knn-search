@@ -9,7 +9,7 @@
 #    ssh over a public TCP relay (bore.pub by default, ngrok optional):
 #    MODE="ssh"         sshd + tunnel -> real terminal, rsync and VS Code
 #                       Remote-SSH from your laptop:
-#                           ssh -p <port> root@bore.pub -i ~/.ssh/kaggle_pcap
+#                           ssh -p <port> root@bore.pub -i ~/.ssh/colab_pcap
 #                       (cloudflared quick tunnels are HTTP-only and cannot
 #                       carry raw ssh, which is why sshd goes through bore)
 #
@@ -56,7 +56,7 @@ CODESERVER_PASSWORD = ""          # empty -> random password is generated
 SSH_PORT = 2222                   # sshd listens on this port inside the VM
 SSH_TUNNEL = "auto"               # "auto" | "bore" | "ngrok"
 AUTHORIZED_KEYS = [               # your LAPTOP public key(s) -> passwordless ssh
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH1/9gyPtYo3E8LFNXxGCNcsgiVmxKR1la2DR5yeycMG kaggle-pcap",
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL6buD6LeUy0agA+wABQ5K+unxY58LTHpN9h/+M5j/23 colab-pcap",
 ]
 NGROK_AUTHTOKEN = ""              # optional: only needed for SSH_TUNNEL="ngrok"
 BUILD_ON_START = True             # make gpu after clone/pull (needs nvcc)
@@ -686,7 +686,7 @@ def smoke_tests(nvcc):
 
 # --------------------------------- output ----------------------------------
 def print_ssh_info(host, port, via, password):
-    key_hint = "~/.ssh/kaggle_pcap"
+    key_hint = "~/.ssh/colab_pcap"
     line()
     line("=" * 72)
     line(f" SSH TUNNEL READY (via {via})")
@@ -707,15 +707,6 @@ def print_ssh_info(host, port, via, password):
     line("       ServerAliveInterval 30")
     line("       ServerAliveCountMax 6")
     line()
-    line(" or write it into remote/kaggle.env and drive the box with")
-    line(" remote/kremote.sh (the same tooling as the Kaggle route):")
-    line()
-    line(f"   KAGGLE_HOST={host}")
-    line(f"   KAGGLE_PORT={port}")
-    line("   KAGGLE_USER=root")
-    line(f"   KAGGLE_KEY={key_hint}")
-    line(f"   KAGGLE_DIR={WORK_DIR}")
-    line()
     line(" first commands once you are in:")
     line(f"   cd {WORK_DIR} && make check-gpu   # build + verify CUDA/MPI on the GPU")
     line("=" * 72)
@@ -726,10 +717,6 @@ def main():
     modes = _modes()
     env_summary()
     kill_previous()
-    ensure_tools()
-    nvcc = ensure_nvcc()
-    clone_repo()
-    build_repo()
 
     failures = []
 
@@ -742,16 +729,26 @@ def main():
             line(f"[warn] {label} failed: {e}")
             return None
 
+    # ---- connection FIRST: sshd + tunnel, printed before anything slow
+    #      (apt, clone, build) can fail or delay them.
     ssh_info = None
     web_url = cs = sshx_url = None
     if "ssh" in modes:
         def ssh_service():
+            apt_install(missing_pkgs(["openssh-server"]))   # no-op on Colab
             password = ensure_sshd()
             host, port, via = start_ssh_tunnel()
             return (host, port, via, password)
         ssh_info = attempt("ssh tunnel", ssh_service)
         if ssh_info:
             print_ssh_info(*ssh_info)      # show it immediately
+
+    # ---- everything else, each step isolated from the tunnel above
+    ensure_tools()
+    nvcc = ensure_nvcc()
+    clone_repo()
+    build_repo()
+
     if "web" in modes:
         web_url = attempt("web frontend", start_frontend)
     if "codeserver" in modes:
@@ -768,7 +765,7 @@ def main():
     line("=" * 72)
     if ssh_info:
         host, port, via, _ = ssh_info
-        line(f" ssh            : ssh -p {port} root@{host} -i ~/.ssh/kaggle_pcap")
+        line(f" ssh            : ssh -p {port} root@{host} -i ~/.ssh/colab_pcap")
     if web_url:
         line(f" web frontend   : {web_url}")
     if cs:

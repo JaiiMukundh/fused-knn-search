@@ -55,7 +55,7 @@ int main(int argc, char** argv) {
     int ndev = 0;
     ck(cudaGetDeviceCount(&ndev), "cudaGetDeviceCount");
     if (ndev < 1) {
-        std::fprintf(stderr, "no CUDA device visible; run this on the GPU box (Colab / Kaggle)\n");
+        std::fprintf(stderr, "no CUDA device visible; run this on the GPU box (Colab)\n");
         return 1;
     }
     cudaDeviceProp prop{};

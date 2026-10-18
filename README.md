@@ -29,18 +29,17 @@ files is a small extension on top of the same interface.
 
 ```bash
 # 1. Colab: New notebook -> Runtime -> Change runtime type -> T4 GPU
-# 2. paste remote/colab_bootstrap.py into one cell and run it
-# 3. it prints an ssh tunnel + URLs:
-#      ssh tunnel     -> ssh -p <port> root@bore.pub -i ~/.ssh/kaggle_pcap
-#                        (terminal, rsync, VS Code Remote-SSH — same rig as Kaggle)
+# 2. one cell -- paste remote/colab_bootstrap.py, or this loader:
+#      import urllib.request as u; exec(u.urlopen(
+#        'https://raw.githubusercontent.com/JaiiMukundh/fused-knn-search/main/remote/colab_bootstrap.py').read())
+# 3. it prints, within the first minute, the ssh tunnel + URLs:
+#      ssh tunnel     -> ssh -p <port> root@bore.pub -i ~/.ssh/colab_pcap
+#                        (terminal, rsync, VS Code Remote-SSH)
 #      web frontend   -> search / sweeps / timings + top-k in the browser
 #      shared terminal-> sshx link for your teammates
 ```
 
 Full walkthrough, sharing and troubleshooting: **[`remote/COLAB_SETUP.md`](remote/COLAB_SETUP.md)**.
-
-The same ssh workflow — `remote/kremote.sh push` · `run make check-gpu` ·
-`pull` — works on Kaggle too: **[`remote/TUNNEL_SETUP.md`](remote/TUNNEL_SETUP.md)**.
 
 Locally (no GPU needed for the CPU side):
 
@@ -118,9 +117,6 @@ frontend/server.py    Flask API driving the binaries (/api/search, /benchmark, /
 frontend/index.html   single-page UI (search, sweeps, build, how-it-works)
 remote/colab_bootstrap.py   Colab cell: ssh (bore) + Cloudflare tunnels + clone + build
 remote/COLAB_SETUP.md       guide for the Colab route
-remote/TUNNEL_SETUP.md      alternative: Kaggle + ssh over bore
-remote/kaggle_bootstrap.py  the Kaggle cell for that route
-remote/kremote.sh           local driver for the Kaggle route (ssh/run/push/pull)
 Makefile              build targets (cpu / gpu / check*)
 ```
 
@@ -132,8 +128,8 @@ Makefile              build targets (cpu / gpu / check*)
 - The MPI sharding is exact: each rank searches its share of the database and
   the merge scans all ranks' candidates; results equal the single-GPU result
   (checked via `--verify`).
-- Free-GPU realities: Colab runtimes recycle (keep the tab open, ~12 h max);
-  Kaggle gives 30 GPU-h/week. Keep sweeps lean and log results to `out/`.
+- Free-GPU realities: Colab runtimes recycle (keep the tab open; ~12 h max,
+  ~90 min idle). Keep sweeps lean and log results to `out/`.
 - Local compile check (no GPU needed): with a CUDA toolchain on the laptop
   (conda `cuda-nvcc` + `cuda-cudart-dev` work), `make gpu NVCC=<env>/bin/nvcc
   CUDA_HOME=<env> CUDA_ARCH_FLAGS='-arch=sm_75'` compiles and links both CUDA

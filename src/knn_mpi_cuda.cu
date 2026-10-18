@@ -4,8 +4,8 @@
 //
 // Sharding and merging are identical to knn_mpi_omp (see that file for the
 // scheme); the difference is that each rank's local search runs on a GPU with
-// fused_topk_kernel from fused_topk.cuh. On Kaggle choose the "GPU T4 x2"
-// accelerator and run -np 2; each rank calls cudaSetDevice(rank % ndevices),
+// fused_topk_kernel from fused_topk.cuh. Run it with -np 2 on a box with two
+// visible GPUs; each rank calls cudaSetDevice(rank % ndevices),
 // so ranks land on different GPUs when more than one is visible.
 //
 // The communication volume stays O(size * q * k) per rank, so this is the

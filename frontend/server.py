@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Web frontend + JSON API for the fused-kNN project.
 
-Runs on the GPU box (Colab / Kaggle / any Linux host). Serves one HTML page and
+Runs on the GPU box (Colab / any Linux host). Serves one HTML page and
 a small API that shells out to the compiled binaries in <repo>/bin and parses
 their [run] / [time] / [verify] / [topk] output lines.
 

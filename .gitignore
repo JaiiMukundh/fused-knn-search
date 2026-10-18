@@ -4,12 +4,9 @@ build/
 *.o
 *.so
 
-# run outputs and datasets (big, regenerate on the Kaggle box)
+# run outputs and datasets (big, regenerate on the GPU box)
 out/
 data/
-
-# local connection settings for the Kaggle tunnel
-remote/kaggle.env
 
 # python
 __pycache__/
