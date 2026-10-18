@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fused kNN Search — GPU lab</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  :root {
+    --bg: #0b0f14; --panel: #111823; --panel2: #0e141d; --line: #1f2b3a;
+    --text: #e6edf3; --dim: #8b98a9; --accent: #60a5fa; --good: #4ade80;
+    --bad: #f87171; --warn: #fbbf24; --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.55 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  header { padding: 22px 26px 14px; border-bottom: 1px solid var(--line); }
+  h1 { margin: 0 0 6px; font-size: 21px; letter-spacing: .2px; }
+  h1 span { color: var(--accent); }
+  .sub { color: var(--dim); font-size: 13.5px; }
+  .badges { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px; }
+  .badge { font: 12px/1 var(--mono); padding: 6px 9px; border: 1px solid var(--line);
+           border-radius: 999px; color: var(--dim); background: var(--panel2); }
+  .badge b { color: var(--text); font-weight: 600; }
+  .badge.good { border-color: #1d4a32; color: var(--good); }
+  .badge.bad { border-color: #55272b; color: var(--bad); }
+  main { max-width: 1080px; margin: 0 auto; padding: 20px 26px 60px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+            padding: 18px 20px; margin-bottom: 18px; }
+  h2 { margin: 0 0 4px; font-size: 16px; }
+  h2 small { color: var(--dim); font-weight: 400; margin-left: 8px; font-size: 12.5px; }
+  .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+          margin: 14px 0; }
+  label { display: block; font-size: 12px; color: var(--dim); margin-bottom: 4px; }
+  input, select { width: 100%; background: var(--panel2); color: var(--text);
+                  border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
+                  font: 14px var(--mono); }
+  input:focus, select:focus { outline: 1px solid var(--accent); }
+  button { background: var(--accent); color: #06121f; border: 0; border-radius: 8px;
+           padding: 10px 16px; font-weight: 700; cursor: pointer; font-size: 14px; }
+  button:hover { filter: brightness(1.1); }
+  button:disabled { opacity: .45; cursor: wait; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .status { color: var(--dim); font-size: 13px; }
+  .cards { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+           margin: 14px 0 6px; }
+  .card { background: var(--panel2); border: 1px solid var(--line); border-radius: 10px;
+          padding: 10px 12px; }
+  .card .k { font-size: 11.5px; color: var(--dim); text-transform: uppercase;
+             letter-spacing: .6px; }
+  .card .v { font: 19px var(--mono); margin-top: 3px; }
+  .card .v small { font-size: 12px; color: var(--dim); }
+  .pill { display: inline-block; padding: 3px 10px; border-radius: 999px; font: 12px var(--mono); }
+  .pill.pass { background: #10321f; color: var(--good); }
+  .pill.fail { background: #3a1618; color: var(--bad); }
+  .pill.na { background: #232a33; color: var(--dim); }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; font: 13.5px var(--mono); }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: 500; font-size: 12px; }
+  tr:hover td { background: var(--panel2); }
+  pre { background: #060a0f; border: 1px solid var(--line); border-radius: 8px; padding: 12px;
+        overflow: auto; font: 12.5px/1.5 var(--mono); color: #b7c4d4; max-height: 340px; }
+  details summary { cursor: pointer; color: var(--dim); font-size: 13px; margin-top: 10px; }
+  footer { color: var(--dim); font-size: 12.5px; text-align: center; margin-top: 26px; }
+  .note { background: var(--panel2); border-left: 3px solid var(--accent); border-radius: 6px;
+          padding: 8px 12px; color: var(--dim); font-size: 13px; margin-top: 10px; }
+  #chart-wrap { position: relative; height: 300px; margin-top: 12px; }
+  .err { color: var(--bad); }
+  .hint { color: var(--warn); font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Fused kNN Search <span>&mdash; GPU lab</span></h1>
+  <div class="sub">Exact vector similarity search: fused distance+top-k CUDA kernel, two-pass comparison,
+  MPI multi-GPU sharding, verified against a double-precision CPU reference.</div>
+  <div class="badges" id="badges"><span class="badge">loading state…</span></div>
+</header>
+
+<main>
+  <!-- ------------------------------------------------------------------ -->
+  <section id="search">
+    <h2>Search <small>one exact kNN run on the GPU box</small></h2>
+    <div class="grid">
+      <div><label>database size (n)</label><input id="n" value="1048576"></div>
+      <div><label>dim (d)</label><input id="d" value="128"></div>
+      <div><label>queries (q)</label><input id="q" value="32"></div>
+      <div><label>k</label><input id="k" value="10"></div>
+      <div><label>seed</label><input id="seed" value="42"></div>
+      <div><label>engine</label><select id="engine">
+        <option value="cuda">knn_cuda (GPU)</option>
+        <option value="omp">knn_omp (CPU)</option>
+      </select></div>
+      <div><label>knbrs in tables</label><select id="dump">
+        <option value="4">4 queries</option><option value="8">8 queries</option>
+        <option value="16">16 queries</option>
+      </select></div>
+      <div><label>two-pass comparison</label><select id="twopass">
+        <option value="1">on</option><option value="0">off</option>
+      </select></div>
+    </div>
+    <div class="row">
+      <button id="run-btn">Run search</button>
+      <span class="status" id="run-status"></span>
+    </div>
+    <div id="run-out"></div>
+  </section>
+
+  <!-- ------------------------------------------------------------------ -->
+  <section id="sweep">
+    <h2>Sweep <small>fused vs two-pass across database sizes</small></h2>
+    <div class="grid">
+      <div style="grid-column: span 2"><label>sizes (comma separated, max 6)</label>
+        <input id="sizes" value="100000,1000000,4000000"></div>
+      <div><label>dim (d)</label><input id="sd" value="128"></div>
+      <div><label>queries (q)</label><input id="sq" value="64"></div>
+      <div><label>k</label><input id="sk" value="10"></div>
+    </div>
+    <div class="row">
+      <button id="sweep-btn">Run sweep</button>
+      <span class="status" id="sweep-status"></span>
+    </div>
+    <div id="sweep-wrap" hidden>
+      <div id="chart-wrap"><canvas id="chart"></canvas></div>
+      <div id="sweep-table"></div>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------------------------ -->
+  <section id="build">
+    <h2>Build <small>compile the binaries on this box (nvcc lives here)</small></h2>
+    <div class="row">
+      <select id="target" style="width: 220px">
+        <option value="gpu">make gpu (CUDA + MPI/CUDA)</option>
+        <option value="cpu">make cpu (OpenMP + MPI/OpenMP)</option>
+        <option value="all">make all</option>
+      </select>
+      <button id="build-btn" class="ghost">Run build</button>
+      <span class="status" id="build-status"></span>
+    </div>
+    <pre id="build-out" hidden></pre>
+  </section>
+
+  <!-- ------------------------------------------------------------------ -->
+  <section id="about">
+    <h2>How it works</h2>
+    <div class="note">
+      <b>Fused kernel</b> — each thread streams the database and keeps its own k-best in registers; a
+      block-level merge in shared memory produces the block's top-k without ever writing the n×q distance
+      matrix to memory. <b>Two-pass</b> — the classical alternative: one kernel materialises all n·q
+      distances, a second scans them. The sweep above measures the memory traffic we save.
+    </div>
+    <div class="note">
+      <b>Exactness</b> — every verified run compares top-1 indices exactly and k-th distances against a
+      double-precision CPU reference (rel. tolerance 1e-3, float vs double). <b>Sharding</b> — the MPI
+      binaries split the database across ranks (one GPU per rank), keep local top-k, then merge to a
+      global top-k; communication stays O(size·q·k), independent of n.
+    </div>
+  </section>
+
+  <footer>
+    <span id="footer-state"></span><br>
+    <a href="https://github.com/JaiiMukundh/fused-knn-search">github.com/JaiiMukundh/fused-knn-search</a>
+    &nbsp;·&nbsp; PCAP mini-project — Samarth Sukumar, Shlok Sharma, Jaii Mukundh
+  </footer>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const fmt = (x, p = 2) => (x === null || x === undefined || Number.isNaN(x)) ? "—" : (+x).toFixed(p);
+let chart = null;
+
+async function api(path, body) {
+  const opt = body ? { method: "POST", headers: { "Content-Type": "application/json" },
+                       body: JSON.stringify(body) } : {};
+  const r = await fetch(path, opt);
+  let data = null;
+  try { data = await r.json(); } catch (e) {}
+  if (!r.ok) throw new Error((data && data.error) || `${r.status} ${r.statusText}`);
+  return data;
+}
+
+async function loadState() {
+  const b = $("badges");
+  try {
+    const s = await api("/api/state");
+    const eng = s.engines || {};
+    const pill = (ok, txt) => `<span class="badge ${ok ? "good" : "bad"}">${txt}</span>`;
+    b.innerHTML =
+      `<span class="badge">${s.gpu ? "GPU <b>" + s.gpu + "</b>" : "no GPU visible"}</span>` +
+      pill(eng.cuda && eng.cuda.available, "cuda binary " + (eng.cuda && eng.cuda.available ? "ready" : "missing")) +
+      pill(eng.omp && eng.omp.available, "cpu binary " + (eng.omp && eng.omp.available ? "ready" : "missing")) +
+      (s.git ? `<span class="badge">rev <b>${s.git}</b></span>` : "") +
+      `<span class="badge">py ${s.python}</span>`;
+    if (!(eng.cuda && eng.cuda.available)) {
+      $("engine").value = eng.omp && eng.omp.available ? "omp" : "cuda";
+    }
+    $("footer-state").textContent = s.root + (s.gpu ? "" : " (no GPU on this host)");
+  } catch (e) {
+    b.innerHTML = `<span class="badge bad">state: ${e.message}</span>`;
+  }
+}
+
+function num(id, dv) { const v = parseInt($(id).value, 10); return Number.isFinite(v) ? v : dv; }
+
+function verifyPill(v) {
+  if (v === "PASS") return '<span class="pill pass">PASS</span>';
+  if (v === "FAIL") return '<span class="pill fail">FAIL</span>';
+  return '<span class="pill na">n/a</span>';
+}
+
+/* ----------------------------------------------------------- search ---- */
+async function doSearch() {
+  const btn = $("run-btn");
+  btn.disabled = true;
+  $("run-status").textContent = "running… (building dataset + kernel)";
+  $("run-out").innerHTML = "";
+  const body = {
+    engine: $("engine").value, n: num("n", 1e6), d: num("d", 128), q: num("q", 32),
+    k: num("k", 10), seed: num("seed", 42), dump: parseInt($("dump").value, 10),
+    twopass: $("twopass").value === "1", verify: 4,
+  };
+  try {
+    const r = await api("/api/search", body);
+    renderSearch(r);
+    $("run-status").textContent = `${r.wall_s}s wall (incl. dataset gen)`;
+  } catch (e) {
+    $("run-status").innerHTML = `<span class="err">${e.message}</span>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderSearch(r) {
+  const kernel = r.engine === "cuda"
+    ? { k: "fused kernel", v: fmt(r.fused_ms, 3) + " <small>ms</small>" }
+    : { k: "cpu search", v: fmt(r.cpu_s, 3) + " <small>s</small>" };
+  const cards = [
+    { k: "engine", v: r.engine + (r.device ? "" : "") , s: r.device || "" },
+    kernel,
+    { k: "per query", v: fmt(r.ms_per_query, 3) + " <small>ms</small>" },
+    { k: "db throughput", v: fmt(r.gbps, 1) + " <small>GB/s</small>" },
+    { k: "compute", v: fmt(r.gflops, 1) + " <small>GFLOP/s</small>" },
+  ];
+  if (r.engine === "cuda" && r.twopass_ms !== null) {
+    cards.push({ k: "two-pass", v: fmt(r.twopass_ms, 3) + " <small>ms</small>",
+                 s: r.speedup ? r.speedup + "× slower than fused" : "" });
+  }
+  let html = '<div class="cards">' + cards.map(c =>
+    `<div class="card"><div class="k">${c.k}</div><div class="v">${c.v}` +
+    (c.s ? `<div class="sub">${c.s}</div>` : "") + `</div></div>`).join("") +
+    `<div class="card"><div class="k">exactness check</div><div class="v">${verifyPill(r.verify)}</div>` +
+    `<div class="sub">vs double-precision CPU</div></div>` +
+    (r.engine === "cuda" && r.twopass_ms !== null
+      ? `<div class="card"><div class="k">fusion speedup</div><div class="v">${fmt(r.speedup, 2)}<small>×</small></div><div class="sub">two-pass / fused</div></div>` : "") +
+    "</div>";
+
+  const qs = Object.keys(r.topk || {}).sort((a, b) => a - b);
+  if (qs.length) {
+    html += `<div class="row" style="margin-top:6px"><label style="margin:0">neighbours of query</label>
+             <select id="qsel" style="width:120px">` +
+      qs.map(q => `<option value="${q}">q ${q}</option>`).join("") + `</select></div>
+             <div id="topk"></div>`;
+  }
+  html += `<details><summary>raw output</summary><pre>${(r.stdout || "").replace(/</g, "&lt;")}</pre></details>`;
+  $("run-out").innerHTML = html;
+  if (qs.length) {
+    const draw = (q) => {
+      const rows = (r.topk[q] || []).map(t =>
+        `<tr><td>${t.rank + 1}</td><td>${t.idx}</td><td>${t.dist.toFixed(6)}</td></tr>`).join("");
+      $("topk").innerHTML = `<table><thead><tr><th>rank</th><th>row index</th><th>l2² distance</th></tr></thead><tbody>${rows}</tbody></table>`;
+    };
+    $("qsel").addEventListener("change", (e) => draw(e.target.value));
+    draw(qs[0]);
+  }
+}
+
+/* ------------------------------------------------------------ sweep ---- */
+async function doSweep() {
+  const btn = $("sweep-btn");
+  btn.disabled = true;
+  $("sweep-status").textContent = "sweeping… each point rebuilds the dataset";
+  $("sweep-wrap").hidden = true;
+  const sizes = $("sizes").value.split(",").map(s => parseInt(s.trim(), 10)).filter(Number.isFinite);
+  try {
+    const r = await api("/api/benchmark", {
+      engine: $("engine").value, sizes, d: num("sd", 128), q: num("sq", 64),
+      k: num("sk", 10), seed: 42, verify: 2,
+    });
+    renderSweep(r);
+    $("sweep-status").textContent = "done";
+  } catch (e) {
+    $("sweep-status").innerHTML = `<span class="err">${e.message}</span>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderSweep(r) {
+  const rows = r.rows || [];
+  $("sweep-wrap").hidden = false;
+  const isCuda = r.engine === "cuda";
+  $("sweep-table").innerHTML = "<table><thead><tr><th>n</th><th>fused</th>" +
+    (isCuda ? "<th>two-pass</th><th>speedup</th>" : "") +
+    "<th>GB/s</th><th>check</th></tr></thead><tbody>" +
+    rows.map(x => x.error
+      ? `<tr><td>${x.n}</td><td colspan="4" class="err">${x.error}</td></tr>`
+      : `<tr><td>${x.n.toLocaleString()}</td>` +
+        (isCuda && x.fused_ms !== null ? `<td>${x.fused_ms.toFixed(2)} ms</td>` : `<td>${x.cpu_s.toFixed(3)} s</td>`) +
+        (isCuda ? `<td>${x.twopass_ms !== null ? x.twopass_ms.toFixed(2) + " ms" : "—"}</td>` +
+                  `<td>${x.speedup ? x.speedup.toFixed(2) + "×" : "—"}</td>` : "") +
+        `<td>${fmt(x.gbps, 1)}</td><td>${verifyPill(x.verify)}</td></tr>`).join("") +
+    "</tbody></table>";
+
+  const okRows = rows.filter(x => !x.error);
+  if (!okRows.length || typeof Chart === "undefined") return;
+  const labels = okRows.map(x => Number(x.n).toLocaleString());
+  const fused = isCuda ? okRows.map(x => x.fused_ms) : okRows.map(x => x.cpu_s * 1000);
+  const fname = isCuda ? "fused kernel (ms)" : "cpu search (ms)";
+  const datasets = [{ label: fname, data: fused, backgroundColor: "#60a5fa",
+                      borderRadius: 4 }];
+  if (isCuda && okRows.every(x => x.twopass_ms !== null)) {
+    datasets.push({ label: "two-pass (ms)", data: okRows.map(x => x.twopass_ms),
+                    backgroundColor: "#4ade80", borderRadius: 4 });
+  }
+  const cfg = {
+    type: "bar",
+    data: { labels, datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: "#e6edf3" } } },
+      scales: {
+        x: { ticks: { color: "#8b98a9" }, grid: { color: "#1f2b3a" } },
+        y: { type: "logarithmic", ticks: { color: "#8b98a9" }, grid: { color: "#1f2b3a" },
+             title: { display: true, text: "milliseconds (log)", color: "#8b98a9" } },
+      },
+    },
+  };
+  if (chart) chart.destroy();
+  chart = new Chart($("chart"), cfg);
+}
+
+/* ------------------------------------------------------------ build ---- */
+async function doBuild() {
+  const btn = $("build-btn");
+  btn.disabled = true;
+  $("build-status").textContent = "building… nvcc takes ~30-60s";
+  try {
+    const r = await api("/api/build", { target: $("target").value });
+    $("build-out").hidden = false;
+    $("build-out").textContent = r.output;
+    $("build-status").innerHTML = r.ok
+      ? '<span style="color:var(--good)">build OK</span>'
+      : `<span class="err">build failed (rc ${r.rc})</span>`;
+    loadState();
+  } catch (e) {
+    $("build-status").innerHTML = `<span class="err">${e.message}</span>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$("run-btn").addEventListener("click", doSearch);
+$("sweep-btn").addEventListener("click", doSweep);
+$("build-btn").addEventListener("click", doBuild);
+loadState();
+</script>
+</body>
+</html>
