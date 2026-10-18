@@ -6,7 +6,7 @@
 #   make gpu        CUDA + MPI/CUDA binaries        (needs nvcc)
 #   make check      build + run small correctness checks
 #   make check-cpu  only the CPU checks (safe without a GPU)
-#   make check-gpu  only the GPU checks (run this on Kaggle, over the tunnel)
+#   make check-gpu  only the GPU checks (run this on the GPU box: Colab/Kaggle, over the tunnel)
 
 SHELL     := /bin/bash
 CXX       ?= g++
@@ -75,7 +75,7 @@ check: check-cpu
 	@if [ -x "$(NVCC)" ] || command -v $(NVCC) >/dev/null 2>&1; then \
 		$(MAKE) check-gpu; \
 	else \
-		echo "[check] nvcc not found: skipping GPU checks (expected on a laptop; run 'make check-gpu' on Kaggle)"; \
+		echo "[check] nvcc not found: skipping GPU checks (expected on a laptop; run 'make check-gpu' on the GPU box: Colab or Kaggle)"; \
 	fi
 
 check-cpu: cpu
@@ -101,7 +101,7 @@ help:
 	@echo "make cpu        -- build OpenMP + MPI/OpenMP CPU baselines"
 	@echo "make gpu        -- build CUDA + MPI/CUDA binaries (needs nvcc)"
 	@echo "make check-cpu  -- run small correctness checks on CPU"
-	@echo "make check-gpu  -- run small correctness checks on GPU (Kaggle)"
+	@echo "make check-gpu  -- run small correctness checks on GPU (Colab/Kaggle)"
 	@echo "make clean"
 	@echo
 	@echo "Examples:"

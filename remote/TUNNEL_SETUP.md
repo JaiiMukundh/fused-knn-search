@@ -1,10 +1,9 @@
 # Run the project on a Kaggle GPU from your laptop
 
-> **Looking for the simpler route?** `remote/COLAB_SETUP.md` sets the project
-> up on a free Colab GPU with a web frontend and browser VS Code, no ssh
-> needed (Cloudflare quick tunnels). This guide is the raw-ssh alternative —
-> it works on Kaggle and gives you a real terminal, rsync and VS Code
-> Remote-SSH from the laptop.
+> **Also available on Colab:** `remote/COLAB_SETUP.md` sets the same project up
+> on a free Colab GPU and also opens a real ssh tunnel (bore) plus a web
+> frontend and browser VS Code. This guide remains the Kaggle route, with the
+> identical ssh/rsync/VS Code Remote-SSH workflow via `kremote.sh`.
 
 Our laptops have no NVIDIA GPU, so all CUDA compilation and execution happens
 on a **Kaggle notebook** (free GPUs: 2× T4). This guide opens an SSH tunnel

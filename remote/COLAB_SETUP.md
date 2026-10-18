@@ -1,20 +1,19 @@
-# Run the project on a free Colab GPU (Cloudflare tunnels)
+# Run the project on a free Colab GPU (ssh tunnel + web frontend)
 
-Colab gives you a free GPU box (usually a T4) and — unlike raw SSH setups —
-the clean way out to the internet is a **Cloudflare quick tunnel**: no
-account, no domain, no credentials. Quick tunnels are HTTP(S)-only, so this
-setup exposes *services* instead of sshd:
+Colab gives you a free GPU box (usually a T4). `remote/colab_bootstrap.py`
+turns it into a machine you can actually use:
 
-- a **web frontend** (`frontend/`) to run searches/sweeps and see the
-  timings + top-k results, and
-- **VS Code in the browser** (code-server) with a full terminal on the same
-  machine, and/or an `sshx` shared terminal.
+- a **real ssh tunnel** — `ssh -p <port> root@bore.pub` from your laptop,
+  with rsync and VS Code Remote-SSH, same workflow as `kremote.sh` has on
+  Kaggle (bare `cloudflared` quick tunnels are HTTP-only, so sshd is exposed
+  through the public **bore** TCP relay instead), and
+- **HTTP services through Cloudflare quick tunnels** (no account, no domain):
+  the **web frontend** (`frontend/`) that runs searches/sweeps on the GPU and
+  shows fused-vs-two-pass timings, **VS Code in the browser** (code-server),
+  and/or an **sshx** shared terminal.
 
-That replaces what the SSH tunnel did: edit, build (`make gpu`), run, and
-watch results — all from a browser tab, on the GPU box.
-
-> Prefer raw ssh from your laptop? `remote/TUNNEL_SETUP.md` keeps that route
-> on Kaggle (bore) alive as an alternative.
+> Prefer Kaggle? `remote/TUNNEL_SETUP.md` is the Kaggle route with the same
+> ssh-over-bore workflow.
 
 ---
 
@@ -22,43 +21,54 @@ watch results — all from a browser tab, on the GPU box.
 
 ```
 1. Colab:  Runtime -> Change runtime type -> GPU (T4)
-2. paste remote/colab_bootstrap.py into one cell, run it  (~2 min first time)
-3. open the URLs it prints:
-     web frontend     https://<random>.trycloudflare.com
-     browser VS Code  https://<random>.trycloudflare.com   (+password)
-     shared terminal  https://sshx.io/...
+2. paste remote/colab_bootstrap.py into one cell, run it  (~2-3 min first time)
+3. it prints, e.g.:
+       ssh            : ssh -p 54321 root@bore.pub -i ~/.ssh/kaggle_pcap
+       web frontend   : https://quiet-river-1234.trycloudflare.com
+       shared terminal: https://sshx.io/#abc123
+4. jump in:
+       ssh -p 54321 root@bore.pub -i ~/.ssh/kaggle_pcap
+       cd /content/pcap && make check-gpu
 ```
 
-The cell clones the GitHub repo, installs mpich, compiles the CUDA/OpenMP/MPI
-binaries, starts the services, and smoke-tests the toolchain.
+The cell clones the GitHub repo, installs mpich + openssh-server, compiles
+the CUDA/OpenMP/MPI binaries (`make gpu` + `make cpu`), starts the tunnels
+and services, and smoke-tests the toolchain.
 
 ---
 
 ## How it works
 
 ```
- your browser                                Colab GPU runtime
- +-------------+                            +-------------------------------+
- | web UI      |   https://xxx.trycloudflare|  cloudflared (2 instances)    |
- | VS Code     |<----------.com ------------|    :8080  frontend/server.py  |
- | sshx term   |                            |    :8443  code-server         |
- +-------------+                            |  /content/pcap  (git clone)   |
-                                            |  nvcc, mpicxx, mpirun         |
-                                            +-------------------------------+
+ your laptop                                      Colab GPU runtime
+ +----------------+                              +-------------------------------+
+ | ssh / rsync    |    bore.pub:<random port>    |  sshd :2222  (key-only login) |
+ | VS Code (SSH)  |<-------- TCP tunnel ---------|      ^                        |
+ |                |                              |      |  bore client           |
+ | web browser:   |                              |      v                        |
+ |   web frontend |    https://xxx.trycloudflare |  cloudflared -> :8080         |
+ |   sshx         |<------- HTTPS tunnel --------|    frontend/server.py         |
+ +----------------+                              |  /content/pcap   (git clone)  |
+                                                 |  nvcc, mpicxx, mpirun         |
+                                                 +-------------------------------+
 ```
 
-`cloudflared tunnel --url http://127.0.0.1:PORT` dials out to Cloudflare's
-edge and gets a random `*.trycloudflare.com` hostname that proxies back in.
-Nothing listens on a public port; every connection arrives through the tunnel
-process, and both the tunnel and the services die with the Colab runtime.
+- **ssh:** the bootstrap starts `sshd` and runs `bore` (`bore local 2222
+  --to bore.pub`), which asks the public relay for a port and forwards it to
+  the VM. Login is key-only with the public key baked into the bootstrap
+  (`AUTHORIZED_KEYS`); your laptop already has the matching private key at
+  `~/.ssh/kaggle_pcap`.
+- **HTTP:** `cloudflared tunnel --url http://127.0.0.1:PORT` dials out to
+  Cloudflare's edge and returns a random `*.trycloudflare.com` hostname that
+  proxies back in. Nothing listens on a public port; every connection arrives
+  through the tunnel processes, and all of it dies with the Colab runtime.
 
-Three services, one per purpose:
-
-| Service | What you do with it | Port |
+| Service | What you do with it | Where |
 |---|---|---|
-| **Web frontend** | run an exact kNN search, watch fused vs two-pass timings, sweep database sizes, build binaries | 8080 |
-| **code-server** | VS Code in the browser: edit files, open a terminal, `git pull`, `make gpu`, run `mpirun` | 8443 |
-| **sshx** | a shared browser terminal — paste the link to teammates, everyone sees the same shell | out |
+| **ssh** | terminal, rsync, VS Code Remote-SSH, `mpirun` — the full box | `bore.pub:<random>` |
+| **web frontend** | run an exact kNN search, fused vs two-pass timings, size sweeps, build binaries | `:8080` via cloudflared |
+| **code-server** | VS Code in the browser (password), `MODE="codeserver"` | `:8443` via cloudflared |
+| **sshx** | shareable browser terminal — send the link to teammates | outbound |
 
 ---
 
@@ -67,30 +77,58 @@ Three services, one per purpose:
 1. <https://colab.research.google.com> → **New notebook**.
 2. **Runtime → Change runtime type → T4 GPU** (free tier).
 3. Paste all of `remote/colab_bootstrap.py` into one cell, run it (▶).
-   First run: installs + downloads + build ≈ 2–3 min.
 
-The cell ends with:
+Config knobs at the top of the file:
 
-```
-========================================================================
- COLAB GPU BOX READY (Cloudflare quick tunnels)
-========================================================================
- web frontend   : https://quiet-river-1234.trycloudflare.com
- browser VS Code: https://lucky-forest-5678.trycloudflare.com   (password: ...)
- shared terminal: https://sshx.io/#abc123
- work dir       : /content/pcap
+```python
+MODE = "all"          # "all" = ssh + web + sshx; or "ssh", "ssh,web", "codeserver", ...
+AUTHORIZED_KEYS = [   # already contains your laptop key (~/.ssh/kaggle_pcap)
+    "ssh-ed25519 AAAA... kaggle-pcap",
+]
+SSH_TUNNEL = "auto"   # bore (default) or ngrok if you set NGROK_AUTHTOKEN
 ```
 
-**Keep the tab open while you work.** Idle Colab runtimes get recycled
-(GPU interactive sessions disconnect after ~90 min of inactivity; 12 h max
-regardless), and everything above dies with the runtime.
+**Keep the tab open while you work.** Idle Colab runtimes get recycled (GPU
+interactive sessions disconnect after ~90 min idle; 12 h max regardless), and
+everything dies with the runtime. The ssh port and all URLs are **new every
+run** — re-running the cell is how you get back in.
 
-**URLs are new every run.** Re-running the cell (or a fresh runtime) restarts
-the tunnels with new random hostnames — re-share them with the team.
+## 2. SSH from your laptop (recommended)
 
----
+Copy the block the cell printed into `remote/kaggle.env`:
 
-## 2. The web frontend
+```
+KAGGLE_HOST=bore.pub
+KAGGLE_PORT=54321
+KAGGLE_USER=root
+KAGGLE_KEY=~/.ssh/kaggle_pcap
+KAGGLE_DIR=/content/pcap
+```
+
+Then drive the box with `remote/kremote.sh`:
+
+```bash
+./remote/kremote.sh ssh                  # interactive shell
+./remote/kremote.sh run make check-gpu   # build + verify CUDA/MPI on the GPU
+./remote/kremote.sh run ./bin/knn_cuda --n 1000000 --d 128 --q 512 --k 10
+./remote/kremote.sh push                 # sync local edits (excl. bin/ out/ data/)
+./remote/kremote.sh pull                 # fetch out/ back
+```
+
+Or add the `Host gpu-pcap` block from the cell output to `~/.ssh/config` and
+use plain `ssh gpu-pcap` / VS Code Remote-SSH.
+
+Notes
+
+- `ssh` expects the private key `~/.ssh/kaggle_pcap` (already generated on
+  this laptop and whitelisted in the bootstrap). If you run the cell with an
+  empty `AUTHORIZED_KEYS`, it prints a one-time root password instead.
+- The relay port is random per run; if ssh refuses after a runtime restart,
+  re-run the cell and paste the new port into `remote/kaggle.env`.
+- `bore.pub` is a public relay: the port is obscure but reachable by anyone —
+  login still requires your key. Treat the tunnel like a draft demo.
+
+## 3. The web frontend
 
 Open the frontend URL and you get one page with four panels:
 
@@ -100,37 +138,23 @@ Open the frontend URL and you get one page with four panels:
   against the double-precision CPU reference, and the actual top-k table
   (indices + distances) for the first few queries.
 - **Sweep** — comma-separated database sizes; runs each with fused and
-  two-pass and renders the comparison chart (log-scale ms) + table. This is
-  the fused-vs-two-pass story of the report in one click.
+  two-pass and renders the comparison chart (log-scale ms) + table.
 - **Build** — `make gpu` / `make cpu` on the box, output shown live-ish.
-  Handy after editing files in code-server.
-- **How it works** — the fused kernel vs two-pass explanation for anyone
-  looking over your shoulder.
+- **How it works** — fused vs two-pass explanation for anyone looking over
+  your shoulder.
 
-Notes
+The page *drives the real binaries* — every number comes from an actual run
+with verification. Runs are capped (n·d ≤ 2e9 ≈ 8 GB host RAM; ≤ 6 sweep
+points) and one job runs at a time.
 
-- The page *drives the real binaries* (`bin/knn_cuda`, `bin/knn_omp`) — it is
-  not a mock; every number comes from an actual GPU run with verification.
-- Runs are capped (n·d ≤ 2e9 ≈ 8 GB host RAM; ≤ 6 sweep points) so nobody
-  can accidentally OOM the runtime, and one job runs at a time.
-- The URL is unlisted but public — anyone who has it can run jobs. Treat it
-  like a draft demo, don't post it anywhere permanent, and re-run the cell to
-  rotate the URL when you're done.
+## 4. Browser VS Code (code-server)
 
-## 3. Browser VS Code (code-server)
+Run the cell with `MODE="codeserver"` (or `"ssh,codeserver"`): open the
+printing URL, log in with the password — editor + terminal on the GPU box.
+Typical loop: edit in the browser → `make gpu` in its terminal → look at
+numbers in the web frontend → commit/push from your laptop later.
 
-Open the code-server URL, log in with the printed password. You get:
-
-- the repo at `/content/pcap` in an editor (CUDA sources included),
-- a terminal where `make gpu`, `./bin/knn_cuda ...`, and
-  `mpirun -np 2 ./bin/knn_mpi_cuda ...` work exactly like on any box,
-- everything running on the GPU machine — your laptop is just the browser.
-
-Typical loop: edit in browser VS Code → run `make gpu` in its terminal (or
-hit Build in the web UI) → look at numbers in the web UI → commit/push from
-your laptop later (see below).
-
-## 4. Editing from the laptop + GitHub flow
+## 5. Editing from the laptop + GitHub flow
 
 The repo on Colab is a plain `git clone` of
 `github.com/JaiiMukundh/fused-knn-search`:
@@ -139,59 +163,64 @@ The repo on Colab is a plain `git clone` of
 # laptop: edit + push as usual
 git add -A && git commit -m "..." && git push
 
-# Colab: get the changes (either re-run the bootstrap cell, which pulls,
-# or in the code-server terminal:)
-cd /content/pcap && git pull --ff-only && make gpu
+# Colab: get the changes — re-run the bootstrap cell (it pulls), or over ssh:
+ssh -p 54321 root@bore.pub -i ~/.ssh/kaggle_pcap \
+    'cd /content/pcap && git pull --ff-only && make gpu'
 ```
 
 Pushing *from* Colab needs credentials; the simple flow is: laptop pushes,
 Colab pulls.
 
-## 5. Team sharing
+## 6. Team sharing
 
-- **Watch mode:** send the web frontend URL — anyone can run searches/sweeps
-  and see results in their browser.
-- **Pair-debugging:** send the sshx link — a shared, end-to-end-encrypted
-  terminal on the GPU box.
-- **Co-editing:** code-server password + URL; note all editors act as the
-  same user, and the password is per-run.
+- **Watch mode:** send the web frontend URL — anyone can run searches/sweeps.
+- **Real terminal:** each teammate can ssh with their own key (add it to
+  `AUTHORIZED_KEYS`) or use the sshx link (shared, end-to-end encrypted).
 - Everyone sees the *same* numbers because datasets are deterministic
-  (`--seed`), and every run verifies against the CPU reference.
+  (`--seed`) and every run verifies against the CPU reference.
 
 ---
 
 ## Facts to keep in mind
 
 - **Free-tier limits:** T4 GPU, ~12.7 GB RAM, ~2 vCPUs, 12 h max session,
-  idle disconnect ~90 min (keep the tab open / interact). Colab may also
-  reclaim runtimes when busy — the cell is cheap to re-run (~2 min), and
-  `/content` is wiped when the runtime goes.
-- **Quick tunnels:** random hostname per run, no account, no SLA — if a URL
-  404s or hangs, check the cell output, re-run it, use the new URL. QUIC/UDP
-  can be blocked on some networks; the bootstrap forces `--protocol http2`
-  so the tunnel only needs outbound TCP 443.
-- **apt/pip** run as root on Colab and are fine; mpich gives you the same
-  `mpicxx`/`mpirun` interface as on Kaggle.
+  idle disconnect ~90 min. Colab may reclaim busy runtimes — re-running the
+  cell costs ~2-3 min and `/content` is wiped.
+- **ssh side:** bore.pub gives a random port per run; the bootstrap forces
+  no password auth once keys are present. If sshd or bore fails to start,
+  the cell says so with a log tail.
+- **HTTP side:** quick tunnels are HTTP-only (hence bore for ssh), random
+  hostname per run, no SLA. QUIC/UDP is blocked on some networks; the
+  bootstrap forces `--protocol http2` so cloudflared only needs outbound
+  TCP 443.
+- **Local compile check (no GPU):** with any CUDA toolchain on the laptop
+  (e.g. conda/micromamba `cuda-nvcc` + `cuda-cudart-dev`), you can compile
+  both CUDA binaries without a GPU:
+  `make gpu NVCC=<env>/bin/nvcc CUDA_HOME=<env> CUDA_ARCH_FLAGS='-arch=sm_75'`
+  — catches API breakage before you spend GPU quota (this is how the CUDA-13
+  `memoryClockRate` removal was found).
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
 | `no GPU visible` in bootstrap | Runtime → Change runtime type → GPU, re-run |
-| `make gpu build FAILED` | open code-server terminal, `cd /content/pcap && make gpu` and read the error (or use the web UI Build panel) |
-| Frontend URL shows 502/nothing | Tunnel was just created — the cell already waits for it; if it persists, re-run the cell (new URL) |
-| `cloudflared` exits / URL never appears | transient edge problem: re-run the cell; check output logs in `/tmp/pcap/cloudflared-*.log` in the code-server terminal |
+| `make gpu build FAILED` | ssh in (or code-server terminal), `cd /content/pcap && make gpu`, read the error |
+| ssh: `Connection refused` | wrong/stale port — re-run the cell, update `remote/kaggle.env` |
+| ssh: `Permission denied` | key mismatch: use `-i ~/.ssh/kaggle_pcap`, or re-run with your public key in `AUTHORIZED_KEYS` |
+| bore port never appears | transient relay problem — re-run the cell; check `/tmp/pcap/bore.log` |
+| Frontend URL shows 502/nothing | edge warm-up or tunnel restart — re-run the cell (new URL) |
 | Everything died after ~90 min | idle recycle — re-run the cell |
-| `Expected 200 from /api/health` | frontend crashed: `/tmp/pcap/frontend.log` (usually flask missing → re-run cell, it pip-installs) |
-| Tunnel works but slow first load | Cloudflare edge warm-up + no CDN caching on quick tunnels; it settles |
+| Tunnel up but first page load slow | Cloudflare edge warm-up on quick tunnels; it settles |
 
-## Alternatives (when you outgrow quick tunnels)
+## Alternatives
 
 | Want | Do |
 |---|---|
-| Stable URL (no changing hostnames) | Cloudflare **named** tunnel + your own domain (free plan; `cloudflared tunnel create/route dns`), same bootstrap otherwise |
-| Raw ssh from the laptop | Kaggle + bore: `remote/TUNNEL_SETUP.md` (kept working) |
-| Just a terminal | `MODE="sshx"` only, or `MODE="web"` + `MODE="sshx"` |
+| Stable URL / own domain | Cloudflare **named** tunnel + domain (free plan), same bootstrap otherwise |
+| Kaggle instead of Colab | `remote/TUNNEL_SETUP.md` (same ssh-over-bore workflow) |
+| Just a terminal | `MODE="ssh"` or `MODE="sshx"` |
+| ngrok instead of bore | set `NGROK_AUTHTOKEN`, `SSH_TUNNEL="ngrok"` (free ngrok now wants a payment method for TCP) |
 
 ## Files in `remote/` (this route)
 
@@ -199,7 +228,8 @@ Colab pulls.
 |---|---|
 | `colab_bootstrap.py` | the cell you paste into Colab (source of truth) |
 | `COLAB_SETUP.md` | this guide |
-| `TUNNEL_SETUP.md`, `kaggle_bootstrap.*`, `kremote.sh`, `kaggle.env.example` | the alternative Kaggle + ssh-over-bore route |
+| `kremote.sh`, `kaggle.env` | laptop driver + connection settings (work with the Colab tunnel; the env var/file names are historical) |
+| `TUNNEL_SETUP.md`, `kaggle_bootstrap.*` | the Kaggle route |
 
 ## Files in `frontend/`
 

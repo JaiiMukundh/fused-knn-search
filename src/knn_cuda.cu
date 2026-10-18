@@ -55,7 +55,7 @@ int main(int argc, char** argv) {
     int ndev = 0;
     ck(cudaGetDeviceCount(&ndev), "cudaGetDeviceCount");
     if (ndev < 1) {
-        std::fprintf(stderr, "no CUDA device visible; run this on the Kaggle GPU box\n");
+        std::fprintf(stderr, "no CUDA device visible; run this on the GPU box (Colab / Kaggle)\n");
         return 1;
     }
     cudaDeviceProp prop{};
@@ -63,9 +63,15 @@ int main(int argc, char** argv) {
     if (!a.n) return 2;
 
     print_run_header("knn_cuda", a);
+#if CUDART_VERSION >= 13000
+    // CUDA 13 removed memoryClockRate/memoryBusWidth from cudaDeviceProp.
+    std::printf("[gpu ] %s (sm_%d%d, %.1f GB)\n", prop.name,
+                prop.major, prop.minor, prop.totalGlobalMem / 1073741824.0);
+#else
     std::printf("[gpu ] %s (sm_%d%d, %.1f GB, %.1f GB/s peak)\n", prop.name,
                 prop.major, prop.minor, prop.totalGlobalMem / 1073741824.0,
                 2.0 * prop.memoryClockRate * (prop.memoryBusWidth / 8) / 1e6);
+#endif
 
     const size_t db_bytes = a.n * (size_t)a.d * sizeof(float);
     const size_t q_bytes = a.q * (size_t)a.d * sizeof(float);

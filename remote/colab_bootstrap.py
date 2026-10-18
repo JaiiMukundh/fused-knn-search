@@ -1,20 +1,28 @@
 # ============================================================================
-#  PCAP mini-project -- Google Colab bootstrap (Cloudflare quick tunnels)
+#  PCAP mini-project -- Google Colab bootstrap (ssh tunnel + web frontend)
 #
 #  Paste this whole file into one cell of a Colab notebook (Runtime ->
 #  Change runtime type -> GPU) and run it. Full guide: remote/COLAB_SETUP.md
 #
-#  Why Cloudflare instead of an ssh tunnel: cloudflared "quick tunnels" need
-#  no account and no domain, but they are HTTP(S)-only -- so instead of
-#  exposing sshd, this cell exposes services that speak HTTP:
+#  Two kinds of access, both credential-free:
 #
+#    ssh over a public TCP relay (bore.pub by default, ngrok optional):
+#    MODE="ssh"         sshd + tunnel -> real terminal, rsync and VS Code
+#                       Remote-SSH from your laptop:
+#                           ssh -p <port> root@bore.pub -i ~/.ssh/kaggle_pcap
+#                       (cloudflared quick tunnels are HTTP-only and cannot
+#                       carry raw ssh, which is why sshd goes through bore)
+#
+#    HTTP services via Cloudflare quick tunnels:
 #    MODE="web"         a web frontend for the project (search + benchmarks)
 #                       served by frontend/server.py, tunnelled to a public
 #                       https://<random>.trycloudflare.com URL
 #    MODE="codeserver"  VS Code in the browser (code-server + password),
 #                       tunnelled the same way -> edit + build in the browser
 #    MODE="sshx"        shareable browser terminal (sshx.io), zero config
-#    MODE="all"         all three (default)
+#
+#    MODE="all"         ssh + web + sshx (default); or combine, e.g.
+#                       MODE="ssh,web" / MODE="ssh,codeserver"
 #
 #  The cell also clones/pulls the GitHub repo, builds the binaries (make gpu)
 #  and runs tiny CUDA/OpenMP/MPI smoke tests so you know the toolchain works.
@@ -37,12 +45,20 @@ import time
 import urllib.request
 
 # ------------------------------- CONFIG ------------------------------------
-MODE = "all"            # "all" | "web" | "codeserver" | "sshx"
+# see the header: "all" = ssh + web + sshx, or list modes explicitly, e.g.
+# MODE = "ssh,web"  |  "ssh"  |  "codeserver"  |  "sshx"
+MODE = "all"
 REPO_URL = "https://github.com/JaiiMukundh/fused-knn-search"
 WORK_DIR = "/content/pcap"        # where the repo lives
 FRONTEND_PORT = 8080              # frontend/server.py listens here
 CODESERVER_PORT = 8443            # code-server listens here
 CODESERVER_PASSWORD = ""          # empty -> random password is generated
+SSH_PORT = 2222                   # sshd listens on this port inside the VM
+SSH_TUNNEL = "auto"               # "auto" | "bore" | "ngrok"
+AUTHORIZED_KEYS = [               # your LAPTOP public key(s) -> passwordless ssh
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH1/9gyPtYo3E8LFNXxGCNcsgiVmxKR1la2DR5yeycMG kaggle-pcap",
+]
+NGROK_AUTHTOKEN = ""              # optional: only needed for SSH_TUNNEL="ngrok"
 BUILD_ON_START = True             # make gpu after clone/pull (needs nvcc)
 INSTALL_MPI = True                # apt-get install mpich (mpicxx, mpirun)
 EXTRA_PACKAGES = ["tmux", "rsync", "htop"]
@@ -154,11 +170,21 @@ def http_ok(url, timeout=10):
 def kill_previous():
     """Stop tunnels/services from an earlier run of this cell."""
     for pat in ("cloudflared tunnel", "frontend/server.py", "code-server -",
-                "/usr/local/bin/sshx"):
+                "/usr/local/bin/sshx", "/usr/sbin/sshd", "bore local"):
         try:
             subprocess.run(["pkill", "-f", pat], capture_output=True)
         except OSError:
             pass
+
+
+def _modes():
+    raw = {m.strip() for m in MODE.replace(",", " ").split() if m.strip()}
+    if "all" in raw:
+        raw = {"ssh", "web", "sshx"}
+    unknown = raw - {"ssh", "web", "codeserver", "sshx"}
+    if unknown:
+        fail(f'unknown MODE entries: {sorted(unknown)} (use ssh|web|codeserver|sshx or "all")')
+    return raw
 
 
 # ----------------------------- environment ---------------------------------
@@ -223,6 +249,8 @@ def ensure_tools():
     want = list(EXTRA_PACKAGES)
     if INSTALL_MPI:
         want.append("mpich")
+    if "ssh" in _modes():
+        want.append("openssh-server")
     apt_install(missing_pkgs(want))
 
 
@@ -247,6 +275,144 @@ def ensure_nvcc():
     except OSError:
         pass
     return nvcc
+
+
+# --------------------------------- sshd ------------------------------------
+def ensure_sshd():
+    os.makedirs("/run/sshd", exist_ok=True)
+    os.makedirs("/root/.ssh", mode=0o700, exist_ok=True)
+    run(["ssh-keygen", "-A"], quiet=True)
+
+    keys = [k.strip() for k in AUTHORIZED_KEYS if k.strip()]
+    password = None
+    if keys:
+        with open("/root/.ssh/authorized_keys", "w") as f:
+            f.write("\n".join(keys) + "\n")
+        os.chmod("/root/.ssh/authorized_keys", 0o600)
+    else:
+        password = secrets.token_urlsafe(12)
+        run(["bash", "-c", f"echo 'root:{password}' | chpasswd"], quiet=True)
+        line("! AUTHORIZED_KEYS is empty -> falling back to password login")
+        line("! (add your laptop's public key to remote/colab_bootstrap.py)")
+
+    logpath = f"{LOG_DIR}/sshd.log"
+    args = ["/usr/sbin/sshd", "-D", "-e",
+            "-p", str(SSH_PORT),
+            "-o", f"PidFile={LOG_DIR}/sshd.pid",
+            "-o", "PermitRootLogin=" + ("prohibit-password" if keys else "yes"),
+            "-o", "PubkeyAuthentication=yes",
+            "-o", "PasswordAuthentication=" + ("no" if keys else "yes"),
+            "-o", "UsePAM=no", "-o", "StrictModes=no",
+            "-o", "AllowTcpForwarding=yes", "-o", "PrintMotd=no",
+            "-o", "ClientAliveInterval=60", "-o", "ClientAliveCountMax=30"]
+    spawn(args, logpath)
+    try:
+        wait_port("127.0.0.1", SSH_PORT, timeout=10)
+    except RuntimeError as e:
+        fail(f"sshd did not start\n{e}\n--- sshd log ---\n{log_tail(logpath, 20)}")
+    line(f"[ssh ] sshd listening on port {SSH_PORT}")
+    return password
+
+
+# ------------------------------- ssh tunnel --------------------------------
+def selected_tunnel():
+    if SSH_TUNNEL not in ("auto", "bore", "ngrok"):
+        fail(f'unknown SSH_TUNNEL="{SSH_TUNNEL}" (use auto|bore|ngrok)')
+    if SSH_TUNNEL == "auto":
+        return "ngrok" if ngrok_token() else "bore"
+    return SSH_TUNNEL
+
+
+def ngrok_token():
+    if NGROK_AUTHTOKEN:
+        return NGROK_AUTHTOKEN
+    return os.environ.get("NGROK_AUTHTOKEN")
+
+
+def ensure_bore():
+    binp = f"{BIN}/bore"
+    if os.path.exists(binp):
+        return binp
+    line("[tun ] downloading bore (github.com/ekzhang/bore)")
+    rel = json.load(urllib.request.urlopen(
+        "https://api.github.com/repos/ekzhang/bore/releases/latest", timeout=60))
+    asset = next(a["browser_download_url"] for a in rel["assets"]
+                 if a["name"].endswith("x86_64-unknown-linux-musl.tar.gz"))
+    tgz = download_file(asset, f"{LOG_DIR}/bore.tgz")
+    extract(tgz, f"{LOG_DIR}/bore_extract")
+    src = glob.glob(f"{LOG_DIR}/bore_extract/*/bore") + glob.glob(f"{LOG_DIR}/bore_extract/bore")
+    os.replace(src[0], binp)
+    os.chmod(binp, 0o755)
+    return binp
+
+
+def start_bore(local_port):
+    binp = ensure_bore()
+    logpath = f"{LOG_DIR}/bore.log"
+    spawn([binp, "local", str(local_port), "--to", "bore.pub"], logpath)
+    m = wait_for_regex(logpath, r"listening at [^:\s]+:(\d+)", 40, "bore public port")
+    return "bore.pub", int(m.group(1))
+
+
+def ensure_ngrok():
+    binp = f"{BIN}/ngrok"
+    if os.path.exists(binp):
+        return binp
+    line("[tun ] downloading ngrok agent")
+    tgz = download_file("https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz",
+                        f"{LOG_DIR}/ngrok.tgz")
+    extract(tgz, f"{LOG_DIR}/ngrok_extract")
+    os.replace(f"{LOG_DIR}/ngrok_extract/ngrok", binp)
+    os.chmod(binp, 0o755)
+    return binp
+
+
+def start_ngrok(local_port):
+    token = ngrok_token()
+    if not token:
+        return None
+    binp = ensure_ngrok()
+    run([binp, "config", "add-authtoken", token], quiet=True)
+    logpath = f"{LOG_DIR}/ngrok.log"
+    spawn([binp, "tcp", str(local_port), "--log", "stdout", "--log-format", "logfmt"], logpath)
+    deadline = time.time() + 45
+    while time.time() < deadline:  # prefer the local REST API
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=2) as r:
+                data = json.load(r)
+            for t in data.get("tunnels", []):
+                u = t.get("public_url", "")
+                if u.startswith("tcp://"):
+                    host, port = u[6:].rsplit(":", 1)
+                    return host, int(port)
+        except Exception:
+            pass
+        time.sleep(1)
+    m = wait_for_regex(logpath, r"url=tcp://([^:\s]+):(\d+)", 10, "ngrok tcp url")
+    return m.group(1), int(m.group(2))
+
+
+def start_ssh_tunnel():
+    order = [selected_tunnel()]
+    if order[0] == "ngrok":
+        order.append("bore")
+    elif ngrok_token():
+        order.append("ngrok")
+    last_err = None
+    for name in order:
+        try:
+            if name == "ngrok":
+                got = start_ngrok(SSH_PORT)
+                if got:
+                    return got[0], got[1], "ngrok"
+                line("[tun ] no ngrok authtoken available; falling back")
+            else:
+                host, port = start_bore(SSH_PORT)
+                return host, port, "bore.pub"
+        except Exception as e:  # try the next tunnel
+            last_err = e
+            line(f"[tun ] {name} failed: {e}")
+    fail(f"no ssh tunnel could be established\n{last_err}")
 
 
 # -------------------------------- repo -------------------------------------
@@ -476,10 +642,45 @@ def smoke_tests(nvcc):
 
 
 # --------------------------------- output ----------------------------------
+def print_ssh_info(host, port, via, password):
+    key_hint = "~/.ssh/kaggle_pcap"
+    line()
+    line("=" * 72)
+    line(f" SSH TUNNEL READY (via {via})")
+    line("=" * 72)
+    line(f" ssh -p {port} root@{host} -i {key_hint}")
+    if password:
+        line(f" (password login fallback: ssh -p {port} root@{host}   password: {password})")
+    line()
+    line(" optional ~/.ssh/config entry (enables plain `ssh gpu-pcap`,")
+    line(" rsync helpers and VS Code Remote-SSH):")
+    line()
+    line("   Host gpu-pcap")
+    line(f"       HostName {host}")
+    line(f"       Port {port}")
+    line("       User root")
+    line(f"       IdentityFile {key_hint}")
+    line("       StrictHostKeyChecking accept-new")
+    line("       ServerAliveInterval 30")
+    line("       ServerAliveCountMax 6")
+    line()
+    line(" or write it into remote/kaggle.env and drive the box with")
+    line(" remote/kremote.sh (the same tooling as the Kaggle route):")
+    line()
+    line(f"   KAGGLE_HOST={host}")
+    line(f"   KAGGLE_PORT={port}")
+    line("   KAGGLE_USER=root")
+    line(f"   KAGGLE_KEY={key_hint}")
+    line(f"   KAGGLE_DIR={WORK_DIR}")
+    line()
+    line(" first commands once you are in:")
+    line(f"   cd {WORK_DIR} && make check-gpu   # build + verify CUDA/MPI on the GPU")
+    line("=" * 72)
+
+
 def main():
     os.makedirs(LOG_DIR, exist_ok=True)
-    if MODE not in ("all", "web", "codeserver", "sshx"):
-        fail(f'unknown MODE="{MODE}" (use all|web|codeserver|sshx)')
+    modes = _modes()
     env_summary()
     kill_previous()
     ensure_tools()
@@ -487,21 +688,32 @@ def main():
     clone_repo()
     build_repo(nvcc)
 
+    ssh_info = None
     web_url = cs = sshx_url = None
-    if MODE in ("web", "all"):
+    if "ssh" in modes:
+        password = ensure_sshd()
+        host, port, via = start_ssh_tunnel()
+        ssh_info = (host, port, via, password)
+    if "web" in modes:
         web_url = start_frontend()
-    if MODE in ("codeserver", "all"):
+    if "codeserver" in modes:
         cs = start_codeserver()
-    if MODE in ("sshx", "all"):
+    if "sshx" in modes:
         sshx_url = start_sshx()
+
+    if ssh_info:
+        print_ssh_info(*ssh_info)
 
     if RUN_SMOKE_TESTS:
         smoke_tests(nvcc)
 
     line()
     line("=" * 72)
-    line(" COLAB GPU BOX READY (Cloudflare quick tunnels)")
+    line(f" COLAB GPU BOX READY  (modes: {', '.join(sorted(modes))})")
     line("=" * 72)
+    if ssh_info:
+        host, port, via, _ = ssh_info
+        line(f" ssh            : ssh -p {port} root@{host} -i ~/.ssh/kaggle_pcap")
     if web_url:
         line(f" web frontend   : {web_url}")
     if cs:
@@ -510,14 +722,14 @@ def main():
         line(f" shared terminal: {sshx_url}")
     line(f" work dir       : {WORK_DIR}")
     line()
-    line(" the web frontend runs searches/sweeps on this box and shows the")
-    line(" timings vs the two-pass variant; VS Code in the browser has a")
-    line(" terminal + editor on the same machine (login with the password).")
+    line(" ssh gives you the whole box (terminal, rsync, VS Code Remote-SSH,")
+    line(" mpirun); the web frontend runs searches/sweeps and shows the")
+    line(f" fused-vs-two-pass timings. first check:  cd {WORK_DIR} && make check-gpu")
     line()
-    line(" URLs change every run (and when the runtime restarts, re-run this")
-    line(" cell). Keep the tab open while you work -- idle Colab runtimes are")
-    line(" recycled and everything here dies with the runtime.")
-    line(" guide + troubleshooting: remote/COLAB_SETUP.md")
+    line(" every hostname/port above changes on each run (and when the runtime")
+    line(" restarts, re-run this cell). Keep the tab open while you work --")
+    line(" idle Colab runtimes are recycled and everything here dies with the")
+    line(" runtime. guide + troubleshooting: remote/COLAB_SETUP.md")
     line("=" * 72)
 
 
