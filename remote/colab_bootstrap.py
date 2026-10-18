@@ -80,12 +80,12 @@ def fail(msg):
     raise RuntimeError(msg)
 
 
-def run(cmd, check=True, timeout=900, quiet=False, env=None):
+def run(cmd, check=True, timeout=900, quiet=False, env=None, cwd=None):
     printable = cmd if isinstance(cmd, str) else " ".join(cmd)
     if not quiet:
         line(f"$ {printable}")
     p = subprocess.run(cmd, shell=isinstance(cmd, str), text=True, capture_output=True,
-                       timeout=timeout, env=env)
+                       timeout=timeout, env=env, cwd=cwd)
     out = (p.stdout or "") + (p.stderr or "")
     if check and p.returncode != 0:
         tail = "\n".join(out.strip().splitlines()[-15:])
@@ -131,6 +131,24 @@ def wait_port(host, port, timeout=10):
     fail(f"port {host}:{port} did not open within {timeout}s")
 
 
+def pick_free_port(preferred=0):
+    """Free TCP port on 127.0.0.1: try `preferred` first, else let the OS pick.
+
+    Colab already occupies 8080 (its internal service), so the frontend must
+    not assume the preferred port is available.
+    """
+    for port in (preferred, 0):
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", port))
+            return s.getsockname()[1]
+        except OSError:
+            continue
+        finally:
+            s.close()
+    fail("no free TCP port found on 127.0.0.1")
+
+
 def wait_for_regex(logpath, pattern, timeout, what):
     rx = re.compile(pattern)
     text = ""
@@ -167,6 +185,17 @@ def http_ok(url, timeout=10):
         return False
 
 
+def wait_http_ok(url, timeout=30):
+    """Poll until the service answers 200 (a bare port check is not enough:
+    on Colab something else may already listen on the port we wanted)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if http_ok(url, timeout=4):
+            return True
+        time.sleep(1)
+    return False
+
+
 def kill_previous():
     """Stop tunnels/services from an earlier run of this cell."""
     for pat in ("cloudflared tunnel", "frontend/server.py", "code-server -",
@@ -190,7 +219,7 @@ def _modes():
 # ----------------------------- environment ---------------------------------
 def env_summary():
     line("=" * 72)
-    line(" PCAP Colab bootstrap (Cloudflare quick tunnels)")
+    line(" PCAP Colab bootstrap (ssh tunnel + web frontend)")
     line("=" * 72)
     if os.geteuid() != 0:
         line("! not running as root -- Colab runtimes are root; some steps may fail")
@@ -429,24 +458,23 @@ def clone_repo():
         line(f"[git ] cloned {REPO_URL} -> {WORK_DIR}")
 
 
-def build_repo(nvcc):
+def build_repo():
     if not BUILD_ON_START:
         return
     if not os.path.isdir(WORK_DIR):
         return
-    line("[make] building (make gpu; first build ~1-2 min)")
-    p = run(["make", "gpu"], check=False, quiet=True, timeout=1800, env=None)
-    ok = p.returncode == 0
-    tail = "\n".join(((p.stdout or "") + (p.stderr or "")).strip().splitlines()[-6:])
-    if ok:
-        line("[make] gpu build OK (bin/knn_cuda, bin/knn_mpi_cuda)")
-    else:
-        line("[make] gpu build FAILED -- fix via the web UI's Build button or:")
-        line(f"       cd {WORK_DIR} && make gpu")
-        line(tail)
-    p = run(["make", "cpu"], check=False, quiet=True, timeout=900)
-    if p.returncode == 0:
-        line("[make] cpu build OK (bin/knn_omp, bin/knn_mpi_omp)")
+    for target, timeout in (("gpu", 1800), ("cpu", 900)):
+        line(f"[make] building (make {target}; first build ~1-2 min)")
+        # NOTE: cwd matters -- the Colab kernel's cwd is /content, not the repo.
+        p = run(["make", target], check=False, quiet=True, timeout=timeout, cwd=WORK_DIR)
+        tail = "\n".join(((p.stdout or "") + (p.stderr or "")).strip().splitlines()[-6:])
+        if p.returncode == 0:
+            line(f"[make] {target} build OK")
+        else:
+            line(f"[make] {target} build FAILED -- run this on the box for details:")
+            line(f"       cd {WORK_DIR} && make {target}")
+            if tail:
+                line(tail)
 
 
 # ------------------------------ cloudflared --------------------------------
@@ -497,11 +525,13 @@ def start_codeserver():
         os.chmod(binp, 0o755)
     pw = CODESERVER_PASSWORD or secrets.token_urlsafe(10)
     env = dict(os.environ, PASSWORD=pw)
+    port = pick_free_port(CODESERVER_PORT)
     logpath = f"{LOG_DIR}/code-server.log"
-    spawn([binp, "--bind-addr", f"127.0.0.1:{CODESERVER_PORT}", "--disable-telemetry",
+    line(f"[tun ] code-server on 127.0.0.1:{port}")
+    spawn([binp, "--bind-addr", f"127.0.0.1:{port}", "--disable-telemetry",
            "--disable-update-check", WORK_DIR], logpath, env=env)
-    wait_port("127.0.0.1", CODESERVER_PORT, timeout=60)
-    url = start_cloudflared(CODESERVER_PORT, "codeserver", metrics_port=20242)
+    wait_port("127.0.0.1", port, timeout=60)
+    url = start_cloudflared(port, "codeserver", metrics_port=20242)
     return {"url": url, "password": pw}
 
 
@@ -532,16 +562,15 @@ def start_frontend():
     if subprocess.run(["python3", "-c", "import flask"], capture_output=True).returncode != 0:
         line("[web ] installing flask (one-time)")
         run(["python3", "-m", "pip", "install", "-q", "flask"], quiet=True, timeout=300)
+    port = pick_free_port(FRONTEND_PORT)   # 8080 is taken on Colab
     logpath = f"{LOG_DIR}/frontend.log"
-    spawn(["python3", f"{WORK_DIR}/frontend/server.py", "--port", str(FRONTEND_PORT)],
+    line(f"[web ] frontend server on 127.0.0.1:{port}")
+    spawn(["python3", f"{WORK_DIR}/frontend/server.py", "--port", str(port)],
           logpath, cwd=WORK_DIR)
-    try:
-        wait_port("127.0.0.1", FRONTEND_PORT, timeout=40)
-    except RuntimeError as e:
-        fail(f"frontend server did not start\n{e}\n--- log ---\n{log_tail(logpath, 20)}")
-    if not http_ok(f"http://127.0.0.1:{FRONTEND_PORT}/api/health", timeout=5):
-        fail(f"frontend health check failed\n--- log ---\n{log_tail(logpath, 20)}")
-    url = start_cloudflared(FRONTEND_PORT, "web", metrics_port=20241)
+    if not wait_http_ok(f"http://127.0.0.1:{port}/api/health", timeout=40):
+        fail(f"frontend health check failed on 127.0.0.1:{port}"
+             f"\n--- log ---\n{log_tail(logpath, 20)}")
+    url = start_cloudflared(port, "web", metrics_port=20241)
     return url
 
 
@@ -686,26 +715,38 @@ def main():
     ensure_tools()
     nvcc = ensure_nvcc()
     clone_repo()
-    build_repo(nvcc)
+    build_repo()
+
+    failures = []
+
+    def attempt(label, fn):
+        """Run one service; never let it hide the others (or the ssh info)."""
+        try:
+            return fn()
+        except Exception as e:
+            failures.append((label, e))
+            line(f"[warn] {label} failed: {e}")
+            return None
 
     ssh_info = None
     web_url = cs = sshx_url = None
     if "ssh" in modes:
-        password = ensure_sshd()
-        host, port, via = start_ssh_tunnel()
-        ssh_info = (host, port, via, password)
+        def ssh_service():
+            password = ensure_sshd()
+            host, port, via = start_ssh_tunnel()
+            return (host, port, via, password)
+        ssh_info = attempt("ssh tunnel", ssh_service)
+        if ssh_info:
+            print_ssh_info(*ssh_info)      # show it immediately
     if "web" in modes:
-        web_url = start_frontend()
+        web_url = attempt("web frontend", start_frontend)
     if "codeserver" in modes:
-        cs = start_codeserver()
+        cs = attempt("code-server", start_codeserver)
     if "sshx" in modes:
-        sshx_url = start_sshx()
-
-    if ssh_info:
-        print_ssh_info(*ssh_info)
+        sshx_url = attempt("sshx", start_sshx)
 
     if RUN_SMOKE_TESTS:
-        smoke_tests(nvcc)
+        attempt("smoke tests", lambda: smoke_tests(nvcc))
 
     line()
     line("=" * 72)
@@ -721,6 +762,12 @@ def main():
     if sshx_url:
         line(f" shared terminal: {sshx_url}")
     line(f" work dir       : {WORK_DIR}")
+    if failures:
+        line()
+        line(" [warn] these failed -- everything else above still works:")
+        for label, e in failures:
+            line(f"   * {label}: {e}")
+        line("   re-run the cell to retry; logs live in /tmp/pcap/")
     line()
     line(" ssh gives you the whole box (terminal, rsync, VS Code Remote-SSH,")
     line(" mpirun); the web frontend runs searches/sweeps and shows the")
@@ -731,6 +778,8 @@ def main():
     line(" idle Colab runtimes are recycled and everything here dies with the")
     line(" runtime. guide + troubleshooting: remote/COLAB_SETUP.md")
     line("=" * 72)
+    if not any((ssh_info, web_url, cs, sshx_url)):
+        fail("no service could be started -- see the warnings above")
 
 
 try:
