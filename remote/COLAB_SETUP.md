@@ -33,11 +33,12 @@ turns it into a machine you can actually use:
        cd /content/pcap && make check-gpu
 ```
 
-The cell installs what it needs (mpich, openssh-server if missing), clones
-`github.com/JaiiMukundh/fused-knn-search` into `/content/pcap`, compiles the
-CUDA/OpenMP/MPI binaries (`make gpu` + `make cpu`), starts the tunnels and
-services, and smoke-tests the toolchain. **The ssh tunnel comes up first** so
-you can connect while the rest finishes.
+The cell installs what it needs (mpich, openssh-server if missing, FAISS for the
+ANN comparison), clones `github.com/JaiiMukundh/fused-knn-search` into
+`/content/pcap`, compiles the CUDA/OpenMP/MPI binaries (`make gpu` + `make cpu`),
+runs one brute-force-vs-ANN comparison, starts the tunnels and services, and
+smoke-tests the toolchain. **The ssh tunnel comes up first** so you can connect
+while the rest finishes.
 
 ---
 
@@ -142,15 +143,19 @@ Notes
 
 ## 3. The web frontend
 
-Open the frontend URL and you get one page with four panels:
+Open the frontend URL and you get one page with five panels:
 
-- **Search** — pick n / d / q / k / seed, engine (`knn_cuda` or the CPU
-  `knn_omp` fallback), run: shows the fused kernel time, db throughput,
+- **Search** — pick n / d / q / k / seed, engine (GPU `knn --device cuda` or the
+  CPU `--device cpu` fallback), run: shows the fused kernel time, db throughput,
   GFLOP/s, the two-pass time + speedup factor, a PASS/FAIL exactness check
   against the double-precision CPU reference, and the actual top-k table
   (indices + distances) for the first few queries.
 - **Sweep** — comma-separated database sizes; runs each with fused and
   two-pass and renders the comparison chart (log-scale ms) + table.
+- **Compare** — Objective 3: brute force (our exact kernel) vs ANN (FAISS).
+  It exports the shared dataset with `bin/gendata`, then sweeps IVF-PQ
+  `nprobe` and HNSW `efSearch`, showing recall@k, ms/query, speedup vs exact
+  and the recall-vs-latency curve.
 - **Build** — `make gpu` / `make cpu` on the box, output shown live-ish.
 - **How it works** — fused vs two-pass explanation for anyone looking over
   your shoulder.
@@ -158,6 +163,23 @@ Open the frontend URL and you get one page with four panels:
 The page *drives the real binaries* — every number comes from an actual run
 with verification. Runs are capped (n·d ≤ 2e9 ≈ 8 GB host RAM; ≤ 6 sweep
 points) and one job runs at a time.
+
+Engine availability is probed, not assumed: the badge turns red with a reason
+(`cuda unavailable: <driver error>`) unless the CUDA path has actually executed
+a tiny search on this box. If a run fails, the panel shows the error and the
+command instead of an empty table.
+
+FAISS itself is installed by the bootstrap cell (`faiss-gpu-cu12`, falling back
+to `faiss-gpu` then `faiss-cpu` — the badge says which). If only the CPU wheel
+installs, recall@k is unchanged and the ANN latencies become CPU numbers; the
+harness prints which device it used.
+
+The bootstrap also runs one comparison automatically and prints the table, and
+from a shell you can do the same:
+
+```bash
+cd /content/pcap && make compare        # writes data/faiss.json
+```
 
 ## 4. Browser VS Code (code-server)
 

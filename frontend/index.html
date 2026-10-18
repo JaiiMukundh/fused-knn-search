@@ -69,6 +69,7 @@
           padding: 8px 12px; color: var(--dim); font-size: 13px; margin-top: 10px; }
   #chart-wrap { position: relative; height: 300px; margin-top: 12px; }
   .err { color: var(--bad); }
+  .note.err { border-left-color: var(--bad); }
   .hint { color: var(--warn); font-size: 13px; }
 </style>
 </head>
@@ -91,8 +92,8 @@
       <div><label>k</label><input id="k" value="10"></div>
       <div><label>seed</label><input id="seed" value="42"></div>
       <div><label>engine</label><select id="engine">
-        <option value="cuda">knn_cuda (GPU)</option>
-        <option value="omp">knn_omp (CPU)</option>
+        <option value="cuda">GPU (knn --device cuda)</option>
+        <option value="cpu">CPU (knn --device cpu)</option>
       </select></div>
       <div><label>knbrs in tables</label><select id="dump">
         <option value="4">4 queries</option><option value="8">8 queries</option>
@@ -127,6 +128,31 @@
       <div id="chart-wrap"><canvas id="chart"></canvas></div>
       <div id="sweep-table"></div>
     </div>
+  </section>
+
+  <!-- ------------------------------------------------------------------ -->
+  <section id="compare">
+    <h2>Brute force vs ANN <small>Objective 3 — exact search against FAISS</small></h2>
+    <div class="note">
+      The exact side is our fused kernel: every true neighbour, recall = 1. The approximate side
+      is FAISS running on the <b>identical vectors</b>, exported by <code>bin/gendata</code> —
+      IVF-PQ and HNSW, swept over <code>nprobe</code> / <code>efSearch</code>. recall@k is
+      measured against the exact ground truth. The question this answers is where the ANN curve
+      buys latency and exactly what recall it costs.
+    </div>
+    <div class="grid">
+      <div><label>database size (n)</label><input id="cn" value="1000000"></div>
+      <div><label>dim (d)</label><input id="cd" value="128"></div>
+      <div><label>queries (q)</label><input id="cq" value="1000"></div>
+      <div><label>k</label><input id="ck" value="10"></div>
+      <div><label>IVF nprobe sweep</label><input id="cnprobe" value="1,4,16,64"></div>
+      <div><label>HNSW efSearch sweep</label><input id="cef" value="16,64,256"></div>
+    </div>
+    <div class="row">
+      <button id="compare-btn">Run comparison</button>
+      <span class="status" id="compare-status"></span>
+    </div>
+    <div id="compare-out"></div>
   </section>
 
   <!-- ------------------------------------------------------------------ -->
@@ -173,6 +199,7 @@
 const $ = (id) => document.getElementById(id);
 const fmt = (x, p = 2) => (x === null || x === undefined || Number.isNaN(x)) ? "—" : (+x).toFixed(p);
 let chart = null;
+let cchart = null;
 
 async function api(path, body) {
   const opt = body ? { method: "POST", headers: { "Content-Type": "application/json" },
@@ -189,17 +216,30 @@ async function loadState() {
   try {
     const s = await api("/api/state");
     const eng = s.engines || {};
-    const pill = (ok, txt) => `<span class="badge ${ok ? "good" : "bad"}">${txt}</span>`;
+    const pill = (ok, txt, why) =>
+      `<span class="badge ${ok ? "good" : "bad"}" title="${(why || "").replace(/"/g, "'")}">${txt}</span>`;
+    const cuda = eng.cuda || {}, cpu = eng.cpu || {}, faiss = eng.faiss || {}, gd = eng.gendata || {};
     b.innerHTML =
-      `<span class="badge">${s.gpu ? "GPU <b>" + s.gpu + "</b>" : "no GPU visible"}</span>` +
-      pill(eng.cuda && eng.cuda.available, "cuda binary " + (eng.cuda && eng.cuda.available ? "ready" : "missing")) +
-      pill(eng.omp && eng.omp.available, "cpu binary " + (eng.omp && eng.omp.available ? "ready" : "missing")) +
+      `<span class="badge" title="${(cuda.reason || "").replace(/"/g, "'")}">` +
+        (s.gpu ? "GPU <b>" + s.gpu + "</b>" : "code"); +
+      `</span>` +
+      pill(cuda.available, "cuda " + (cuda.available ? "ready" : "unavailable"), cuda.reason) +
+      pill(cpu.available, "cpu " + (cpu.available ? "ready" : "missing"), cpu.reason) +
+      pill(faiss.available, "faiss " + (faiss.available ? (faiss.version + (faiss.gpus ? " ·gpu" : " ·cpu")) : "missing"), faiss.reason) +
+      pill(gd.available, "gendata " + (gd.available ? "ready" : "missing"), gd.reason) +
       (s.git ? `<span class="badge">rev <b>${s.git}</b></span>` : "") +
       `<span class="badge">py ${s.python}</span>`;
-    if (!(eng.cuda && eng.cuda.available)) {
-      $("engine").value = eng.omp && eng.omp.available ? "omp" : "cuda";
+    if (!cuda.available && cpu.available) $("engine").value = "cpu";
+    if (!cpu.available && cuda.available) $("engine").value = "cuda";
+    $("footer-state").textContent = s.root + (cuda.available ? "" : " — cuda unavailable: " + (cuda.reason || "unknown"));
+    const cb = $("compare-btn");
+    if (cb) {
+      cb.disabled = !faiss.available || !gd.available;
+      if (!faiss.available) $("compare-status").innerHTML =
+        `<span class="hint">needs faiss — ${faiss.reason || "not installed"}</span>`;
+      else if (!gd.available) $("compare-status").innerHTML =
+        `<span class="hint">needs bin/gendata — run Build (make cpu)</span>`;
     }
-    $("footer-state").textContent = s.root + (s.gpu ? "" : " (no GPU on this host)");
   } catch (e) {
     b.innerHTML = `<span class="badge bad">state: ${e.message}</span>`;
   }
@@ -236,6 +276,14 @@ async function doSearch() {
 }
 
 function renderSearch(r) {
+  if (r.ok === false) {
+    $("run-out").innerHTML =
+      `<div class="note err"><b>run failed</b> (rc ${r.rc}) — a real failure, not an empty result.</div>` +
+      `<pre>${(r.stdout || "").replace(/</g, "&lt;")}</pre>` +
+      `<div class="hint">cmd: ${r.cmd || ""}</div>`;
+    $("run-status").innerHTML = `<span class="err">failed — see below</span>`;
+    return;
+  }
   const kernel = r.engine === "cuda"
     ? { k: "fused kernel", v: fmt(r.fused_ms, 3) + " <small>ms</small>" }
     : { k: "cpu search", v: fmt(r.cpu_s, 3) + " <small>s</small>" };
@@ -344,6 +392,121 @@ function renderSweep(r) {
   chart = new Chart($("chart"), cfg);
 }
 
+/* ---------------------------------------------------------- compare ---- */
+async function doCompare() {
+  const btn = $("compare-btn");
+  btn.disabled = true;
+  $("compare-out").innerHTML = "";
+  $("compare-status").textContent =
+    "exporting data then benchmarking FAISS… (the first run also builds the dataset)";
+  const body = {
+    n: num("cn", 1e6), d: num("cd", 128), q: num("cq", 1000), k: num("ck", 10),
+    nprobe: $("cnprobe").value, efsearch: $("cef").value,
+  };
+  try {
+    const r = await api("/api/compare", body);
+    renderCompare(r);
+    $("compare-status").textContent = `done in ${r.wall_s}s` +
+      (r.exported_data ? " (dataset exported)" : " (reused exported data)");
+  } catch (e) {
+    $("compare-status").innerHTML = `<span class="err">${e.message}</span>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderCompare(r) {
+  const k = r.k, rows = r.ann || [], exact = r.exact;
+  let html = '<div class="cards">';
+  if (exact) {
+    html += `<div class="card"><div class="k">exact — FAISS flat (${exact.device})</div>` +
+      `<div class="v">${fmt(exact.ms_per_query, 4)} <small>ms/q</small></div>` +
+      `<div class="sub">brute force · recall 1.000</div></div>`;
+  }
+  if (r.ours && r.ours.ok) {
+    html += `<div class="card"><div class="k">exact — our fused kernel</div>` +
+      `<div class="v">${fmt(r.ours.ms_per_query, 4)} <small>ms/q</small></div>` +
+      `<div class="sub">${r.ours.device || "gpu"} · verify ${r.ours.verify || "n/a"}</div></div>`;
+  }
+  html += `<div class="card"><div class="k">ground truth</div>` +
+    `<div class="v" style="font-size:12px;line-height:1.3">${r.gt_source || "n/a"}</div>` +
+    `<div class="sub">faiss ${r.faiss_version || "?"}</div></div>`;
+  html += "</div>";
+
+  if (rows.length) {
+    html += `<table><thead><tr><th>index</th><th>device</th><th>knob</th>` +
+      `<th>recall@${k}</th><th>ms/query</th><th>speedup vs exact</th></tr></thead><tbody>` +
+      rows.map((x) => {
+        const knob = x.nprobe !== undefined ? `nprobe=${x.nprobe}` : `efSearch=${x.efSearch}`;
+        const rel = exact && exact.ms_per_query ? exact.ms_per_query / x.ms_per_query : null;
+        return `<tr><td>${x.index}</td><td>${x.device}</td><td>${knob}</td>` +
+          `<td>${x.recall_at_k.toFixed(4)}</td><td>${x.ms_per_query.toFixed(4)}</td>` +
+          `<td>${rel ? rel.toFixed(2) + "×" : "—"}</td></tr>`;
+      }).join("") + "</tbody></table>";
+    html += `<div class="hint">“speedup vs exact” = how many times faster than brute force at that recall.</div>`;
+  } else {
+    html += `<div class="note err">the harness returned no approximate-index rows</div>`;
+  }
+  html += `<div id="ccompare-wrap" style="height:340px;margin-top:14px"><canvas id="cchart"></canvas></div>`;
+  html += `<details style="margin-top:10px"><summary>harness log</summary><pre>` +
+    String(r.log || "").replace(/</g, "&lt;") + "</pre></details>";
+  $("compare-out").innerHTML = html;
+
+  if (typeof Chart === "undefined" || !rows.length) return;
+  const byIndex = {};
+  rows.forEach((x) => {
+    const knob = x.nprobe !== undefined ? x.nprobe : x.efSearch;
+    (byIndex[x.index] = byIndex[x.index] || []).push(
+      { x: x.ms_per_query, y: x.recall_at_k, knob });
+  });
+  const colors = { ivfpq: "#4ade80", hnsw: "#fbbf24", ivfflat: "#a78bfa" };
+  const datasets = Object.keys(byIndex).map((name) => ({
+    label: name,
+    data: byIndex[name].slice().sort((a, b) => a.knob - b.knob),
+    borderColor: colors[name] || "#60a5fa",
+    backgroundColor: colors[name] || "#60a5fa",
+    pointRadius: 5, pointHoverRadius: 7, showLine: true, tension: 0.15,
+  }));
+  if (exact) {
+    datasets.push({
+      label: "exact (recall 1.0)",
+      data: [{ x: exact.ms_per_query, y: 1.0, knob: "—" }],
+      backgroundColor: "#60a5fa", borderColor: "#60a5fa",
+      pointRadius: 8, pointStyle: "rectRot", showLine: false,
+    });
+  }
+  const cf = {
+    type: "line",
+    data: { datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { labels: { color: "#e6edf3" } },
+        tooltip: {
+          callbacks: {
+            label: (c) => `${c.dataset.label}: recall ${c.raw.y.toFixed(4)} @ ` +
+              `${c.raw.x.toFixed(4)} ms/q (knob ${c.raw.knob})`,
+          },
+        },
+      },
+      scales: {
+        x: {
+          type: "logarithmic",
+          title: { display: true, text: "latency per query (ms, log)", color: "#8b98a9" },
+          ticks: { color: "#8b98a9" }, grid: { color: "#1f2b3a" },
+        },
+        y: {
+          min: 0, max: 1.02,
+          title: { display: true, text: `recall@${k}`, color: "#8b98a9" },
+          ticks: { color: "#8b98a9" }, grid: { color: "#1f2b3a" },
+        },
+      },
+    },
+  };
+  if (cchart) cchart.destroy();
+  cchart = new Chart($("cchart"), cf);
+}
+
 /* ------------------------------------------------------------ build ---- */
 async function doBuild() {
   const btn = $("build-btn");
@@ -366,6 +529,7 @@ async function doBuild() {
 
 $("run-btn").addEventListener("click", doSearch);
 $("sweep-btn").addEventListener("click", doSweep);
+$("compare-btn").addEventListener("click", doCompare);
 $("build-btn").addEventListener("click", doBuild);
 loadState();
 </script>

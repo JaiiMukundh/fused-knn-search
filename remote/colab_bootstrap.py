@@ -63,6 +63,9 @@ BUILD_ON_START = True             # make gpu after clone/pull (needs nvcc)
 INSTALL_MPI = True                # apt-get install mpich (mpicxx, mpirun)
 EXTRA_PACKAGES = ["tmux", "rsync", "htop"]
 RUN_SMOKE_TESTS = True
+INSTALL_FAISS = True              # pip install faiss-gpu (falls back to faiss-cpu): Objective 3
+RUN_COMPARISON = True             # after building, run brute force vs ANN once and print the table
+COMPARE_N = 200000                # database size for that automatic comparison
 # ----------------------------------------------------------------------------
 
 BIN = "/usr/local/bin"
@@ -491,6 +494,84 @@ def build_repo():
                 line(tail)
 
 
+# ------------------------------- faiss (ANN) --------------------------------
+def _faiss_probe():
+    """-> {'v': version, 'g': visible GPU count} or None if faiss is absent."""
+    code = ("import json, faiss;"
+            "print(json.dumps({'v': faiss.__version__,"
+            "'g': int(getattr(faiss, 'get_num_gpus', lambda: 0)())}))")
+    p = run(["python3", "-c", code], check=False, quiet=True, timeout=180)
+    if p.returncode != 0:
+        return None
+    try:
+        return json.loads(((p.stdout or "").strip().splitlines() or ["{}"])[-1])
+    except Exception:
+        return None
+
+
+def ensure_faiss():
+    """Install FAISS for the approximate-index side of the comparison.
+
+    faiss-gpu is the point (the comparison should run on the GPU), but the
+    wheel naming moves with CUDA versions, so try the CUDA-12 wheels first and
+    fall back to faiss-cpu. recall@k is identical either way; only the latency
+    side changes, and the harness prints which one it used.
+    """
+    if not INSTALL_FAISS:
+        return None
+    st = _faiss_probe()
+    if st and st.get("g", 0) > 0:
+        line(f"[ann ] faiss {st['v']} with {st['g']} GPU(s) already available")
+        return st
+
+    for pkg in ("faiss-gpu-cu12", "faiss-gpu", "faiss-cpu"):
+        line(f"[ann ] pip install {pkg} (one-time)")
+        p = run(["python3", "-m", "pip", "install", "-q", "--no-cache-dir", pkg],
+                check=False, quiet=True, timeout=900)
+        if p.returncode != 0:
+            continue
+        st = _faiss_probe()
+        if st and (st.get("g", 0) > 0 or pkg == "faiss-cpu"):
+            gpu = f"{st['g']} GPU(s)" if st.get("g", 0) else "CPU only"
+            line(f"[ann ] faiss {st['v']} ({pkg}, {gpu})")
+            if not st.get("g", 0):
+                line("[ann ] note: no GPU FAISS wheel worked here -- recall is the same,")
+                line("      but the ANN latencies below are CPU numbers.")
+            return st
+
+    line("[ann ] could not install faiss -- the Compare panel will stay disabled")
+    return None
+
+
+def run_comparison():
+    """Objective 3, once, on the freshly built binaries: brute force vs ANN."""
+    gd = f"{WORK_DIR}/bin/gendata"
+    harness = f"{WORK_DIR}/bench/faiss_compare.py"
+    if not (os.path.exists(gd) and os.path.exists(harness)):
+        line("[ann ] skipping the comparison (bin/gendata or bench/faiss_compare.py missing)")
+        return
+    data = f"{WORK_DIR}/data"
+    line(f"[ann ] exporting {COMPARE_N} x 128 vectors for the comparison")
+    p = run([gd, "--n", str(COMPARE_N), "--d", "128", "--q", "200", "--k", "10",
+             "--out", data], check=False, quiet=True, timeout=1800, cwd=WORK_DIR)
+    if p.returncode != 0:
+        line("[ann ] gendata failed: " + ((p.stderr or p.stdout or "").strip()[-300:]))
+        return
+    p = run(["python3", harness, "--data", data, "--k", "10",
+             "--nprobe", "1,4,16,64", "--efsearch", "16,64,256",
+             "--json", f"{data}/faiss.json"],
+            check=False, quiet=True, timeout=3600, cwd=WORK_DIR)
+    out = ((p.stdout or "") + (p.stderr or "")).strip()
+    if p.returncode != 0:
+        line("[ann ] comparison failed: " + "\n".join(out.splitlines()[-8:]))
+        return
+    lines = [ln for ln in out.splitlines()
+             if ln.startswith(("[faiss]", "[gt  ]", "[exact]", "[ivfpq]", "[hnsw ]", "[verdict]"))]
+    for ln in lines[-20:]:
+        line("[ann ] " + ln.strip())
+    line(f"[ann ] full JSON: {data}/faiss.json (also shown in the web frontend)")
+
+
 # ------------------------------ cloudflared --------------------------------
 def ensure_cloudflared():
     binp = f"{BIN}/cloudflared"
@@ -748,6 +829,9 @@ def main():
     nvcc = ensure_nvcc()
     clone_repo()
     build_repo()
+    attempt("faiss install", ensure_faiss)
+    if RUN_COMPARISON:
+        attempt("brute-force vs ANN comparison", run_comparison)
 
     if "web" in modes:
         web_url = attempt("web frontend", start_frontend)
@@ -783,6 +867,9 @@ def main():
     line(" ssh gives you the whole box (terminal, rsync, VS Code Remote-SSH,")
     line(" mpirun); the web frontend runs searches/sweeps and shows the")
     line(f" fused-vs-two-pass timings. first check:  cd {WORK_DIR} && make check-gpu")
+    line()
+    line(" Objective 3 (brute force vs ANN) is the Compare panel in the web UI,")
+    line(f" or:  cd {WORK_DIR} && make compare   (writes data/faiss.json)")
     line()
     line(" every hostname/port above changes on each run (and when the runtime")
     line(" restarts, re-run this cell). Keep the tab open while you work --")
